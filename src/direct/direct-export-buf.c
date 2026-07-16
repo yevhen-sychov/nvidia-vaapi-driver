@@ -36,6 +36,12 @@ static void findGPUIndexFromFd(NVDriver *drv) {
     uint8_t drmUuid[16];
     get_device_uuid(&drv->driverContext, drmUuid);
 
+    /* If CUDA is not available (32-bit encode-only mode), default to GPU 0 */
+    if (!drv->cudaAvailable) {
+        drv->cudaGpuId = 0;
+        return;
+    }
+
     int gpuCount = 0;
     if (CHECK_CUDA_RESULT(drv->cu->cuDeviceGetCount(&gpuCount))) {
         return;
@@ -412,7 +418,7 @@ static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface
 
     backingImage->totalSize = calculate_unified_image_layout(&drv->driverContext, driverImages, surface->width, surface->height,
                                                              fmtInfo->bppc, fmtInfo->numPlanes, fmtInfo->plane);
-    LOG_DEBUG("Allocating single BackingImage: %p %ux%u = %u bytes", backingImage, surface->width, surface->height, backingImage->totalSize);
+    LOG("Allocating single BackingImage: %p %ux%u (format %d) = %u bytes", backingImage, surface->width, surface->height, backingImage->format, backingImage->totalSize);
 
     int memFd = -1;
     int memFd2 = -1;
@@ -451,6 +457,11 @@ static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface
             .numLevels = 1,
             .offset = driverImages[i].offset
         };
+
+        LOG("Plane %u: %ux%u offset=%u pitch=%u size=%u Format=%d NumChannels=%d",
+            i, mipmapArrayDesc.arrayDesc.Width, mipmapArrayDesc.arrayDesc.Height,
+            mipmapArrayDesc.offset, driverImages[i].pitch, driverImages[i].memorySize,
+            mipmapArrayDesc.arrayDesc.Format, mipmapArrayDesc.arrayDesc.NumChannels);
 
         if (CHECK_CUDA_RESULT(drv->cu->cuExternalMemoryGetMappedMipmappedArray(&backingImage->cudaImages[i].mipmapArray, backingImage->extMem, &mipmapArrayDesc))) {
             goto fail;
@@ -551,9 +562,26 @@ static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surfa
                     p[i].channelCount, 8 * fmtInfo->bppc, p[i].fourcc, &driverImages[i]);
     }
 
-    for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-        if (!import_to_cuda(drv, &driverImages[i], 8 * fmtInfo->bppc, p[i].channelCount, &backingImage->cudaImages[i], &backingImage->arrays[i]))
-            goto bail;
+    /* Import into CUDA only when CUDA is available.
+     * In IPC encode-only mode, surfaces are allocated via DRM but not imported
+     * into CUDA — the 64-bit helper handles CUDA import from the DMA-BUF fd. */
+    if (drv->cudaAvailable) {
+        for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+            if (!import_to_cuda(drv, &driverImages[i], 8 * fmtInfo->bppc, p[i].channelCount, &backingImage->cudaImages[i], &backingImage->arrays[i]))
+                goto bail;
+        }
+    } else {
+        /* Without CUDA, keep the nvFd handles for the IPC helper to import.
+         * Close nvFd2 which import_to_cuda would normally close. */
+        for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+            backingImage->nvFds[i] = driverImages[i].nvFd;
+            backingImage->memorySizes[i] = driverImages[i].memorySize;
+            driverImages[i].nvFd = 0; /* Ownership transferred to backingImage */
+            if (driverImages[i].nvFd2 != 0) {
+                close(driverImages[i].nvFd2);
+                driverImages[i].nvFd2 = 0;
+            }
+        }
     }
 
     backingImage->width = surface->width;
@@ -614,6 +642,10 @@ static void destroyBackingImage(NVDriver *drv, BackingImage *img) {
     for (int i = 0; i < 4; i++) {
         if (img->fds[i] >= 0) {
             close(img->fds[i]);
+        }
+        /* Close NVIDIA opaque fds kept for IPC encode mode */
+        if (img->nvFds[i] > 0) {
+            close(img->nvFds[i]);
         }
     }
 
@@ -860,7 +892,16 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
     desc->width = surface->width;
     desc->height = surface->height;
 
+    /* Export each plane as its own layer (separate-layers form).
+     * This is the layout the NVIDIA direct backend has always used for
+     * decode surfaces and is what Chromium's zero-copy import path expects.
+     * Collapsing multi-planar formats into a single composed layer breaks
+     * browser decode display, so keep one layer per plane here. */
     desc->num_layers = fmtInfo->numPlanes;
+
+    LOG_DEBUG("Exporting surface descriptor: fourcc=0x%x, size=%ux%u, layers=%u",
+        desc->fourcc, desc->width, desc->height, desc->num_layers);
+
     nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS);
     if (img->isSingleBuffer) {
         nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS_SINGLE);
