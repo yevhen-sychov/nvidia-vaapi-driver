@@ -671,6 +671,34 @@ int pictureIdxFromSurfaceId(NVDriver *drv, VASurfaceID surfId) {
     return -1;
 }
 
+/* Used by the DESCRIPTOR_MODE_AUTO export-layout heuristic
+ * (direct_fillExportDescriptor()) to tell apart a decode surface that is a
+ * local self-preview (Chrome re-decoding its own outgoing encoded stream to
+ * render a thumbnail) from one that is genuinely a remote peer's video.
+ *
+ * VA-API gives no explicit signal for this, but a decode context created at
+ * exactly the same resolution as a currently-active local encode context is,
+ * in practice, always this self-preview case: a remote peer's video is
+ * essentially never encoded at the exact same pixel dimensions as your own
+ * outgoing capture. So if any active OBJECT_TYPE_CONTEXT is an encode
+ * context with a matching width/height, treat the decode surface the same
+ * way encode surfaces are treated (combined export layout). */
+bool nvHasActiveEncodeContextWithResolution(NVDriver *drv, uint32_t width, uint32_t height) {
+    bool found = false;
+    pthread_mutex_lock(&drv->objectCreationMutex);
+    ARRAY_FOR_EACH(Object, o, &drv->objects)
+        if (o->type == OBJECT_TYPE_CONTEXT) {
+            NVContext *ctx = (NVContext*) o->obj;
+            if (ctx != NULL && ctx->isEncode && ctx->width == width && ctx->height == height) {
+                found = true;
+                break;
+            }
+        }
+    END_FOR_EACH
+    pthread_mutex_unlock(&drv->objectCreationMutex);
+    return found;
+}
+
 static void setSurfaceResolving(NVSurface *surface, bool resolving);
 static void waitSurfaceResolved(NVSurface *surface);
 
@@ -1014,6 +1042,27 @@ static void nvGetConfigAttributesEncode(
         case VAConfigAttribRateControl:
             attrib_list[i].value = VA_RC_CQP | VA_RC_CBR | VA_RC_VBR;
             break;
+        case VAConfigAttribEncRateControlExt: {
+            /* Advertise temporal-layer (SVC) support so clients such as
+             * Chrome/WebRTC will use the hardware encoder for temporal
+             * scalability modes (e.g. L1T2/L1T3 screenshare) instead of
+             * falling back to software. This is currently wired end-to-end
+             * only for AV1 (layer structure parsing + NVENC temporal SVC
+             * config), so report it only for AV1 to avoid falsely claiming
+             * support for codecs whose per-layer path is not implemented.
+             * NVENC supports up to 4 temporal layers, so report
+             * max_num_temporal_layers_minus1=3. Per-temporal-layer bitrate
+             * control is not implemented, so leave the flag at 0. */
+            if (profile == VAProfileAV1Profile0) {
+                VAConfigAttribValEncRateControlExt v = { .value = 0 };
+                v.bits.max_num_temporal_layers_minus1 = 3;
+                v.bits.temporal_layer_bitrate_control_flag = 0;
+                attrib_list[i].value = v.value;
+            } else {
+                attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
+            }
+            break;
+        }
         case VAConfigAttribEncPackedHeaders:
             //accept all packed header types; NVENC generates its own but
             //apps (Steam) expect the driver to accept them without warning
@@ -1217,7 +1266,14 @@ static VAStatus nvCreateConfig(
 
         for (int i = 0; i < num_attribs; i++) {
             if (attrib_list[i].type == VAConfigAttribRTFormat) {
-                if (attrib_list[i].value & VA_RT_FORMAT_YUV420_10) {
+                /* Select 10-bit encode only when 10-bit is requested AND plain
+                 * 8-bit YUV420 is NOT also present. Clients that echo back the
+                 * capability mask we advertise for AV1 (VA_RT_FORMAT_YUV420 |
+                 * VA_RT_FORMAT_YUV420_10) mean "either", not "10-bit"; treating
+                 * that as 10-bit and then receiving 8-bit NV12 surfaces makes
+                 * the input copy fail and the whole encode aborts. */
+                if ((attrib_list[i].value & VA_RT_FORMAT_YUV420_10) &&
+                    !(attrib_list[i].value & VA_RT_FORMAT_YUV420)) {
                     cfg->bitDepth = 10;
                     cfg->surfaceFormat = cudaVideoSurfaceFormat_P016;
                 }
@@ -1297,7 +1353,12 @@ static VAStatus nvCreateConfig(
             /* AV1 Profile 0 supports both 8-bit and 10-bit.
              * If RTFormat is specified, use it to decide.
              * Otherwise default to 8-bit (NV12) for maximum compatibility. */
-            if (rtFormat != 0) {
+            /* Pick the higher bit depth only when the plain 8-bit YUV420 bit is
+             * NOT also set. The capability mask we advertise for AV1 Profile0 is
+             * (VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10); a client echoing
+             * that back means "either", so default to 8-bit rather than forcing
+             * a 10-bit (P016) decoder onto an 8-bit stream. */
+            if (rtFormat != 0 && !(rtFormat & VA_RT_FORMAT_YUV420)) {
                 if ((rtFormat & VA_RT_FORMAT_YUV420_12) != 0) {
                     cfg->surfaceFormat = cudaVideoSurfaceFormat_P016;
                     cfg->bitDepth = 12;
@@ -3818,6 +3879,7 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
             .qualityLevel = nvencCtx->qualityLevel,
             .rcMode = nvencCtx->rcMode,
             .is10bit = (nvencCtx->inputFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? 1 : 0,
+            .numTemporalLayers = nvencCtx->numTemporalLayers,
         };
 
         int shm_fd = -1;
@@ -5255,18 +5317,29 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     drv->maxDetachedBackingImages =
         (uint32_t) parseEnvU64("NVD_MAX_DETACHED_BACKING_IMAGES", DEFAULT_MAX_DETACHED_BACKING_IMAGES);
 
+    /* Default (unset or "auto") lets the driver pick the per-surface layout
+     * on its own: encode-context surfaces (local capture/preview) get the
+     * COMBINED layout, decode-context surfaces (remote/video display) get
+     * the SINGLE (split-layer) layout — see DESCRIPTOR_MODE_AUTO and its
+     * use in direct_allocateBackingImage()/direct_fillExportDescriptor().
+     * Explicitly setting single/multi/combined forces that layout for every
+     * surface, overriding the automatic per-surface decision. */
     const char *modeEnv = getenv("NVD_DESCRIPTOR_MODE");
     if (modeEnv != NULL && strcmp(modeEnv, "single") == 0) {
         drv->descriptorMode = DESCRIPTOR_MODE_SINGLE;
     } else if (modeEnv != NULL && strcmp(modeEnv, "multi") == 0) {
         drv->descriptorMode = DESCRIPTOR_MODE_MULTI;
+    } else if (modeEnv != NULL && strcmp(modeEnv, "combined") == 0) {
+        drv->descriptorMode = DESCRIPTOR_MODE_COMBINED;
     } else if (modeEnv != NULL && strcmp(modeEnv, "auto") != 0) {
         LOG("Ignoring invalid NVD_DESCRIPTOR_MODE=%s", modeEnv);
-        drv->descriptorMode = DESCRIPTOR_MODE_SINGLE;
+        drv->descriptorMode = DESCRIPTOR_MODE_AUTO;
     } else {
-        drv->descriptorMode = DESCRIPTOR_MODE_SINGLE;
+        drv->descriptorMode = DESCRIPTOR_MODE_AUTO;
     }
-    LOG("Descriptor mode: %s", drv->descriptorMode == DESCRIPTOR_MODE_SINGLE ? "single" : "multi")
+    LOG("Descriptor mode: %s", drv->descriptorMode == DESCRIPTOR_MODE_SINGLE ? "single" :
+        drv->descriptorMode == DESCRIPTOR_MODE_COMBINED ? "combined" :
+        drv->descriptorMode == DESCRIPTOR_MODE_AUTO ? "auto" : "multi")
 
     const char *statsEnv = getenv("NVD_STATS");
     if (statsEnv != NULL && strcmp(statsEnv, "0") != 0) {

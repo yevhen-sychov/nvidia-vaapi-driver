@@ -333,6 +333,7 @@ extern const NVFormatInfo formatsInfo[];
 void appendBuffer(AppendableBuffer *ab, const void *buf, uint64_t size);
 int pictureIdxFromSurfaceId(NVDriver *ctx, VASurfaceID surf);
 NVSurface* nvSurfaceFromSurfaceId(NVDriver *drv, VASurfaceID surf);
+bool nvHasActiveEncodeContextWithResolution(NVDriver *drv, uint32_t width, uint32_t height);
 const char *nvColorStandardName(VAProcColorStandardType colorStandard);
 VAProcColorStandardType nvColorStandardFromMatrixCoefficients(uint8_t matrixCoefficients);
 void nvSurfaceResetColorMetadata(NVSurface *surface);

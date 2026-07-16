@@ -170,7 +170,24 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
         nvencCtx->encodeConfig.encodeCodecConfig.av1Config.repeatSeqHdr = 1;
         nvencCtx->encodeConfig.encodeCodecConfig.av1Config.idrPeriod = nvencCtx->intraPeriod > 0 ? nvencCtx->intraPeriod : 0xffffffff;
         nvencCtx->encodeConfig.encodeCodecConfig.av1Config.maxNumRefFramesInDPB = 8;
-        nvencCtx->encodeConfig.encodeCodecConfig.av1Config.maxTemporalLayersMinus1 = 3;
+
+        /* Temporal SVC (e.g. WebRTC L1T2/L1T3 screenshare). Only enable when the
+         * application actually requested more than one temporal layer, otherwise
+         * a plain single-layer stream is produced. */
+        if (nvencCtx->numTemporalLayers > 1) {
+            uint32_t layers = nvencCtx->numTemporalLayers;
+            if (layers > 4) {
+                layers = 4; /* NVENC AV1 supports up to 4 temporal layers */
+            }
+            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.enableTemporalSVC = 1;
+            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.numTemporalLayers = layers;
+            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.maxTemporalLayersMinus1 = layers - 1;
+            LOG("NVENC: AV1 temporal SVC enabled, layers=%u", layers);
+        } else {
+            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.enableTemporalSVC = 0;
+            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.numTemporalLayers = 0;
+            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.maxTemporalLayersMinus1 = 0;
+        }
     }
 
     if (nvencCtx->rcMode != 0) {

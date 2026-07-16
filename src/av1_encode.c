@@ -122,6 +122,16 @@ void av1enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
             nvencCtx->qualityLevel = ql->quality_level;
         break;
     }
+    case VAEncMiscParameterTypeTemporalLayerStructure: {
+        VAEncMiscParameterTemporalLayerStructure *tl =
+            (VAEncMiscParameterTemporalLayerStructure*) misc->data;
+        if (tl->number_of_layers > 0) {
+            nvencCtx->numTemporalLayers = tl->number_of_layers;
+            LOG("AV1 encode: temporal layer structure, number_of_layers=%u",
+                tl->number_of_layers);
+        }
+        break;
+    }
     default:
         break;
     }

@@ -270,7 +270,23 @@ static bool encoder_init(HelperEncoder *enc, const NVEncIPCInitParams *params)
         encConfig.encodeCodecConfig.av1Config.repeatSeqHdr = 1;
         encConfig.encodeCodecConfig.av1Config.idrPeriod = params->gopLength > 0 ? params->gopLength : 0xffffffff;
         encConfig.encodeCodecConfig.av1Config.maxNumRefFramesInDPB = 8;
-        encConfig.encodeCodecConfig.av1Config.maxTemporalLayersMinus1 = 3;
+
+        /* Temporal SVC (e.g. WebRTC L1T2/L1T3). Only enable when the client
+         * actually requested more than one temporal layer. */
+        if (params->numTemporalLayers > 1) {
+            uint32_t layers = params->numTemporalLayers;
+            if (layers > 4) {
+                layers = 4; /* NVENC AV1 supports up to 4 temporal layers */
+            }
+            encConfig.encodeCodecConfig.av1Config.enableTemporalSVC = 1;
+            encConfig.encodeCodecConfig.av1Config.numTemporalLayers = layers;
+            encConfig.encodeCodecConfig.av1Config.maxTemporalLayersMinus1 = layers - 1;
+            HELPER_LOG("AV1 temporal SVC enabled, layers=%u", layers);
+        } else {
+            encConfig.encodeCodecConfig.av1Config.enableTemporalSVC = 0;
+            encConfig.encodeCodecConfig.av1Config.numTemporalLayers = 0;
+            encConfig.encodeCodecConfig.av1Config.maxTemporalLayersMinus1 = 0;
+        }
     }
 
     if (params->rcMode != 0) {

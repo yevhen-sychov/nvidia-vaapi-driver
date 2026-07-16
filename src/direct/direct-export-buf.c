@@ -506,7 +506,24 @@ fail:
 }
 
 static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surface) {
-    if (drv->descriptorMode == DESCRIPTOR_MODE_SINGLE && !isRgbSurfaceFourcc((uint32_t) surface->fourcc)) {
+    /* direct_allocateBackingImage_single() unconditionally imports the buffer
+     * into CUDA (cuImportExternalMemory) with no fallback. When this process
+     * has no CUDA (e.g. a 32-bit sandboxed GPU process using the 64-bit
+     * nvenc-helper over IPC — see nvEndPictureEncodeIPC()), that call would
+     * either crash or fail outright, and the per-plane nvFds[] the IPC path
+     * needs would never be populated. Only take the single-buffer path when
+     * CUDA is actually available; otherwise fall through to the per-plane
+     * allocator below, which already has an explicit !cudaAvailable branch
+     * that keeps the nvFd handles for the helper to import.
+     *
+     * AUTO mode always allocates through the single-buffer path too: the
+     * per-surface choice between the split and combined *layer* layout is
+     * made later, at export time in direct_fillExportDescriptor(), and both
+     * layouts are produced from the same single-buffer backing image. */
+    if (drv->cudaAvailable &&
+        (drv->descriptorMode == DESCRIPTOR_MODE_SINGLE || drv->descriptorMode == DESCRIPTOR_MODE_COMBINED ||
+         drv->descriptorMode == DESCRIPTOR_MODE_AUTO) &&
+        !isRgbSurfaceFourcc((uint32_t) surface->fourcc)) {
         return direct_allocateBackingImage_single(drv, surface);
     }
 
@@ -892,12 +909,49 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
     desc->width = surface->width;
     desc->height = surface->height;
 
-    /* Export each plane as its own layer (separate-layers form).
-     * This is the layout the NVIDIA direct backend has always used for
-     * decode surfaces and is what Chromium's zero-copy import path expects.
-     * Collapsing multi-planar formats into a single composed layer breaks
-     * browser decode display, so keep one layer per plane here. */
-    desc->num_layers = fmtInfo->numPlanes;
+    /* COMBINED-style export: a single layer carrying the combined fourcc
+     * (e.g. NV12) with multiple planes, instead of one split single-channel
+     * layer per plane (R8 + GR88). Some EGL/ANGLE DMA-BUF importers
+     * (Chrome's WebGL/canvas "video-processing" worker path, used to render
+     * the local encode/capture preview) only advertise support for the
+     * combined fourcc and reject the split layout with EGL_BAD_MATCH. The
+     * normal decode-display zero-copy import path, on the other hand,
+     * expects (and must keep getting) the split per-plane layer form. It
+     * requires a single-buffer backing image, so it only applies when
+     * img->isSingleBuffer is true.
+     *
+     * In AUTO mode (the default) this decision is made per-surface instead
+     * of globally: surfaces that belong to an encode context (local
+     * capture/preview, which Chrome imports through the WebGL/canvas
+     * worker path) use the combined layer; surfaces that belong to a
+     * decode context (remote/video display) keep the split layer. This is
+     * exactly the encode-vs-decode split observed in practice: forcing
+     * COMBINED globally fixed the local AV1 preview but broke remote
+     * decode display, and vice versa for SINGLE/MULTI. Explicitly setting
+     * NVD_DESCRIPTOR_MODE=single/multi/combined overrides this and forces
+     * that layout for every surface, as before.
+     *
+     * One decode-context case still needs the combined layer, though:
+     * Chrome sometimes renders a local screenshare/camera self-preview by
+     * decoding its own just-encoded stream back (rather than reusing the
+     * pre-encode frame), which goes through the exact same WebGL/canvas
+     * worker importer as the encode-preview path and hits the same
+     * EGL_BAD_MATCH otherwise. There is no VA-API-visible flag telling us
+     * "this decode is a self-preview", but such a decode context is always
+     * created at exactly the same resolution as the local encode context
+     * it is re-decoding — a genuine remote peer's video is essentially
+     * never encoded at that exact pixel size. So a decode surface whose
+     * resolution matches a currently-active local encode context is also
+     * treated as combined. */
+    const bool isEncodeSurface = surface->context != NULL && surface->context->isEncode;
+    const bool isSelfPreviewDecode = !isEncodeSurface &&
+        nvHasActiveEncodeContextWithResolution(drv, surface->width, surface->height);
+    const bool wantsCombined = drv->descriptorMode == DESCRIPTOR_MODE_COMBINED ||
+                                (drv->descriptorMode == DESCRIPTOR_MODE_AUTO &&
+                                 (isEncodeSurface || isSelfPreviewDecode));
+    const bool combinedLayer = wantsCombined && fmtInfo->numPlanes > 1 && img->isSingleBuffer;
+
+    desc->num_layers = combinedLayer ? 1 : fmtInfo->numPlanes;
 
     LOG_DEBUG("Exporting surface descriptor: fourcc=0x%x, size=%ux%u, layers=%u",
         desc->fourcc, desc->width, desc->height, desc->num_layers);
@@ -910,12 +964,22 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
         desc->objects[0].size = img->totalSize;
         desc->objects[0].drm_format_modifier = img->mods[0];
 
-        for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-            desc->layers[i].drm_format = fmtInfo->plane[i].fourcc;
-            desc->layers[i].num_planes = 1;
-            desc->layers[i].object_index[0] = 0;
-            desc->layers[i].offset[0] = img->offsets[i];
-            desc->layers[i].pitch[0] = img->strides[i];
+        if (combinedLayer) {
+            desc->layers[0].drm_format = fmtInfo->fourcc;
+            desc->layers[0].num_planes = fmtInfo->numPlanes;
+            for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+                desc->layers[0].object_index[i] = 0;
+                desc->layers[0].offset[i] = img->offsets[i];
+                desc->layers[0].pitch[i] = img->strides[i];
+            }
+        } else {
+            for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+                desc->layers[i].drm_format = fmtInfo->plane[i].fourcc;
+                desc->layers[i].num_planes = 1;
+                desc->layers[i].object_index[0] = 0;
+                desc->layers[i].offset[0] = img->offsets[i];
+                desc->layers[i].pitch[0] = img->strides[i];
+            }
         }
     } else {
         nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS_MULTI);

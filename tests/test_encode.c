@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <va/va.h>
 #include <va/va_drm.h>
+#include <va/va_drmcommon.h>
 #include <va/va_enc_h264.h>
 #include <va/va_enc_hevc.h>
 #include <va/va_enc_av1.h>
@@ -597,6 +598,223 @@ static void test_av1_temporal_layers(void)
     TEST_PASS();
 }
 
+/* The driver advertises the AV1 encode RTFormat as the combined mask
+ * VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10. A client that echoes that
+ * queried mask into vaCreateConfig and then feeds 8-bit NV12 frames must still
+ * encode successfully. Previously the driver treated any config whose mask had
+ * the 10-bit bit set as a 10-bit encode, so the 8-bit input copy failed and
+ * vaEndPicture returned an error — the sort of hard NVENC failure that crashes
+ * a browser's GPU process (dropping *decode* to software too). */
+static void test_av1_combined_rtformat_encode(void)
+{
+    TEST_START("AV1 encode 8-bit frame with advertised RTFormat mask");
+
+    VAConfigAttrib q = { .type = VAConfigAttribRTFormat };
+    VAStatus st = vaGetConfigAttributes(dpy, VAProfileAV1Profile0, VAEntrypointEncSlice, &q, 1);
+    if (st != VA_STATUS_SUCCESS) { TEST_SKIP("AV1 not supported"); return; }
+    TEST_ASSERT(q.value & VA_RT_FORMAT_YUV420, "8-bit YUV420 not advertised for AV1 encode");
+
+    /* Use the advertised mask verbatim (may contain both 8-bit and 10-bit). */
+    VAConfigAttrib attrib = { .type = VAConfigAttribRTFormat, .value = q.value };
+    VAConfigID config;
+    st = vaCreateConfig(dpy, VAProfileAV1Profile0, VAEntrypointEncSlice, &attrib, 1, &config);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "config");
+
+    VASurfaceID surface;
+    st = vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, 320, 240, &surface, 1, NULL, 0);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "surface");
+
+    VAContextID context;
+    st = vaCreateContext(dpy, config, 320, 240, VA_PROGRESSIVE, &surface, 1, &context);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "context");
+
+    VABufferID coded;
+    st = vaCreateBuffer(dpy, context, VAEncCodedBufferType, 320 * 240, 1, NULL, &coded);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "coded_buf");
+
+    VAImageFormat fmt = { .fourcc = VA_FOURCC_NV12 };
+    VAImage image;
+    vaCreateImage(dpy, &fmt, 320, 240, &image);
+    void *img_data;
+    vaMapBuffer(dpy, image.buf, &img_data);
+    memset(img_data, 128, image.data_size);
+    vaUnmapBuffer(dpy, image.buf);
+    vaPutImage(dpy, surface, image.image_id, 0, 0, 320, 240, 0, 0, 320, 240);
+
+    VAEncSequenceParameterBufferAV1 seq = { .intra_period = 30 };
+    VAEncPictureParameterBufferAV1 pic = {
+        .coded_buf = coded,
+        .frame_width_minus_1 = 319, .frame_height_minus_1 = 239,
+        .picture_flags.bits.frame_type = 0,
+    };
+    VABufferID seq_buf, pic_buf;
+    vaCreateBuffer(dpy, context, VAEncSequenceParameterBufferType, sizeof(seq), 1, &seq, &seq_buf);
+    vaCreateBuffer(dpy, context, VAEncPictureParameterBufferType, sizeof(pic), 1, &pic, &pic_buf);
+
+    st = vaBeginPicture(dpy, context, surface);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaBeginPicture");
+    VABufferID bufs[] = { seq_buf, pic_buf };
+    st = vaRenderPicture(dpy, context, bufs, 2);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaRenderPicture");
+    st = vaEndPicture(dpy, context);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaEndPicture");
+    st = vaSyncSurface(dpy, surface);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaSyncSurface");
+
+    VACodedBufferSegment *seg = NULL;
+    st = vaMapBuffer(dpy, coded, (void **)&seg);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaMapBuffer");
+    TEST_ASSERT(seg != NULL && seg->size > 0, "empty coded buffer");
+    vaUnmapBuffer(dpy, coded);
+
+    vaDestroyBuffer(dpy, coded);
+    vaDestroyBuffer(dpy, seq_buf);
+    vaDestroyBuffer(dpy, pic_buf);
+    vaDestroyImage(dpy, image.image_id);
+    vaDestroyContext(dpy, context);
+    vaDestroySurfaces(dpy, &surface, 1);
+    vaDestroyConfig(dpy, config);
+    TEST_PASS();
+}
+
+/* Reproduces Chrome/WebRTC L1T2 screenshare: the encoder is configured with
+ * VAConfigAttribEncRateControlExt (temporal layers) and driven with a
+ * VAEncMiscParameterTemporalLayerStructure (number_of_layers=2) plus per-frame
+ * temporal_id. This is the exact path that must produce a valid hardware AV1
+ * stream — if the driver mis-programs NVENC temporal SVC here, Chrome's GPU
+ * process fails and *all* hardware acceleration (including decode) falls back
+ * to software. */
+static void test_av1_temporal_svc_encode(void)
+{
+    TEST_START("AV1 temporal SVC L1T2 encode (misc layer structure)");
+
+    VAConfigAttrib attribs[3] = {
+        { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 },
+        { .type = VAConfigAttribRateControl, .value = VA_RC_CBR },
+        { .type = VAConfigAttribEncRateControlExt },
+    };
+    /* Query what the driver advertises for temporal layers, like Chrome does. */
+    VAStatus st = vaGetConfigAttributes(dpy, VAProfileAV1Profile0,
+                                        VAEntrypointEncSlice, attribs, 3);
+    if (st != VA_STATUS_SUCCESS) { TEST_SKIP("AV1 not supported"); return; }
+    TEST_ASSERT(attribs[2].value != VA_ATTRIB_NOT_SUPPORTED,
+                "VAConfigAttribEncRateControlExt not advertised for AV1");
+    {
+        VAConfigAttribValEncRateControlExt v = { .value = attribs[2].value };
+        TEST_ASSERT(v.bits.max_num_temporal_layers_minus1 >= 1,
+                    "driver advertises fewer than 2 temporal layers");
+    }
+
+    /* Create the config the way Chrome does: request a single concrete
+     * RTFormat (8-bit YUV420), not the full capability mask returned by the
+     * query above. */
+    VAConfigAttrib cfg_attribs[3] = {
+        { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 },
+        { .type = VAConfigAttribRateControl, .value = VA_RC_CBR },
+        { .type = VAConfigAttribEncRateControlExt, .value = attribs[2].value },
+    };
+    VAConfigID config;
+    st = vaCreateConfig(dpy, VAProfileAV1Profile0, VAEntrypointEncSlice,
+                        cfg_attribs, 3, &config);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "config");
+
+    VASurfaceID surface;
+    st = vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, 320, 240, &surface, 1, NULL, 0);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "surface");
+
+    VAContextID context;
+    st = vaCreateContext(dpy, config, 320, 240, VA_PROGRESSIVE, &surface, 1, &context);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "context");
+
+    VABufferID coded;
+    st = vaCreateBuffer(dpy, context, VAEncCodedBufferType, 320 * 240, 1, NULL, &coded);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "coded_buf");
+
+    /* Fill surface with gray. */
+    VAImageFormat fmt = { .fourcc = VA_FOURCC_NV12 };
+    VAImage image;
+    vaCreateImage(dpy, &fmt, 320, 240, &image);
+    void *img_data;
+    vaMapBuffer(dpy, image.buf, &img_data);
+    memset(img_data, 128, image.data_size);
+    vaUnmapBuffer(dpy, image.buf);
+    vaPutImage(dpy, surface, image.image_id, 0, 0, 320, 240, 0, 0, 320, 240);
+
+    /* L1T2 temporal pattern: layer 0,1,0,1,... */
+    const int temporal_ids[8] = { 0, 1, 0, 1, 0, 1, 0, 1 };
+
+    for (int i = 0; i < 8; i++) {
+        /* Misc: temporal layer structure (only meaningful on first frame, but
+         * Chrome resends it; the driver must tolerate it). */
+        VABufferID tl_buf;
+        unsigned int tl_size = sizeof(VAEncMiscParameterBuffer) +
+                               sizeof(VAEncMiscParameterTemporalLayerStructure);
+        VAEncMiscParameterBuffer *misc_tl;
+        vaCreateBuffer(dpy, context, VAEncMiscParameterBufferType, tl_size, 1, NULL, &tl_buf);
+        vaMapBuffer(dpy, tl_buf, (void **)&misc_tl);
+        misc_tl->type = VAEncMiscParameterTypeTemporalLayerStructure;
+        VAEncMiscParameterTemporalLayerStructure *tl =
+            (VAEncMiscParameterTemporalLayerStructure *)misc_tl->data;
+        tl->number_of_layers = 2;
+        tl->periodicity = 2;
+        tl->layer_id[0] = 0;
+        tl->layer_id[1] = 1;
+        vaUnmapBuffer(dpy, tl_buf);
+
+        /* Misc: rate control (CBR). */
+        VABufferID rc_buf;
+        unsigned int rc_size = sizeof(VAEncMiscParameterBuffer) +
+                               sizeof(VAEncMiscParameterRateControl);
+        VAEncMiscParameterBuffer *misc_rc;
+        vaCreateBuffer(dpy, context, VAEncMiscParameterBufferType, rc_size, 1, NULL, &rc_buf);
+        vaMapBuffer(dpy, rc_buf, (void **)&misc_rc);
+        misc_rc->type = VAEncMiscParameterTypeRateControl;
+        VAEncMiscParameterRateControl *rc = (VAEncMiscParameterRateControl *)misc_rc->data;
+        rc->bits_per_second = 2000000;
+        rc->target_percentage = 90;
+        vaUnmapBuffer(dpy, rc_buf);
+
+        VAEncSequenceParameterBufferAV1 seq = { .intra_period = 60 };
+        VAEncPictureParameterBufferAV1 pic = {
+            .coded_buf = coded,
+            .frame_width_minus_1 = 319, .frame_height_minus_1 = 239,
+            .temporal_id = temporal_ids[i],
+            .picture_flags.bits.frame_type = (i == 0) ? 0 : 1,
+        };
+        VABufferID seq_buf, pic_buf;
+        vaCreateBuffer(dpy, context, VAEncSequenceParameterBufferType, sizeof(seq), 1, &seq, &seq_buf);
+        vaCreateBuffer(dpy, context, VAEncPictureParameterBufferType, sizeof(pic), 1, &pic, &pic_buf);
+
+        st = vaBeginPicture(dpy, context, surface);
+        TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaBeginPicture");
+        VABufferID bufs[] = { tl_buf, rc_buf, seq_buf, pic_buf };
+        st = vaRenderPicture(dpy, context, bufs, 4);
+        TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaRenderPicture");
+        st = vaEndPicture(dpy, context);
+        TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaEndPicture");
+        st = vaSyncSurface(dpy, surface);
+        TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaSyncSurface");
+
+        VACodedBufferSegment *seg = NULL;
+        st = vaMapBuffer(dpy, coded, (void **)&seg);
+        TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaMapBuffer");
+        TEST_ASSERT(seg != NULL && seg->size > 0, "empty coded buffer for SVC frame");
+        vaUnmapBuffer(dpy, coded);
+
+        vaDestroyBuffer(dpy, tl_buf);
+        vaDestroyBuffer(dpy, rc_buf);
+        vaDestroyBuffer(dpy, seq_buf);
+        vaDestroyBuffer(dpy, pic_buf);
+    }
+
+    vaDestroyBuffer(dpy, coded);
+    vaDestroyImage(dpy, image.image_id);
+    vaDestroyContext(dpy, context);
+    vaDestroySurfaces(dpy, &surface, 1);
+    vaDestroyConfig(dpy, config);
+    TEST_PASS();
+}
+
 static void test_av1_main10_one_frame(void)
 {
     TEST_START("AV1 Main10 encode 1 frame (10-bit P010)");
@@ -860,6 +1078,62 @@ cleanup:
     vaDestroyConfig(dpy, config);
 }
 
+/* --- Test: automatic descriptor mode (NVD_DESCRIPTOR_MODE unset/auto) --- */
+
+/* With NVD_DESCRIPTOR_MODE left unset (the default AUTO mode), surfaces that
+ * belong to an encode context should be exported as a single combined-fourcc
+ * layer (e.g. NV12 with 2 planes), since that's the layout Chrome's
+ * WebGL/canvas "video-processing" worker path needs to render the local
+ * capture/preview into before it's handed to NVENC. This must happen without
+ * the user having to set NVD_DESCRIPTOR_MODE=combined manually. */
+static void test_encode_surface_export_auto_combined(void)
+{
+    TEST_START("Encode surface export defaults to combined layer (auto mode)");
+
+    VAConfigAttrib attrib = { .type = VAConfigAttribRTFormat,
+                               .value = VA_RT_FORMAT_YUV420 };
+    VAConfigID config;
+    VAStatus st = vaCreateConfig(dpy, VAProfileH264High, VAEntrypointEncSlice,
+                                  &attrib, 1, &config);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "config");
+
+    VASurfaceID surface;
+    st = vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, 320, 240, &surface, 1, NULL, 0);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "surface");
+
+    VAContextID context;
+    st = vaCreateContext(dpy, config, 320, 240, VA_PROGRESSIVE, &surface, 1, &context);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "context");
+
+    VABufferID coded_buf;
+    st = vaCreateBuffer(dpy, context, VAEncCodedBufferType, 320 * 240, 1, NULL, &coded_buf);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "coded_buf");
+
+    /* vaBeginPicture() is what associates the surface with its (encode)
+     * context internally; the export decision relies on that association
+     * being in place, matching how Chrome always drives a real session. */
+    st = vaBeginPicture(dpy, context, surface);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaBeginPicture");
+
+    VADRMPRIMESurfaceDescriptor desc;
+    st = vaExportSurfaceHandle(dpy, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                                VA_EXPORT_SURFACE_SEPARATE_LAYERS, &desc);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaExportSurfaceHandle failed");
+    TEST_ASSERT(desc.num_objects == 1, "encode surface should export a single DMA-BUF object");
+    TEST_ASSERT(desc.num_layers == 1,
+                "encode surface should default to a single combined layer, not split per-plane");
+    for (int i = 0; i < desc.num_objects; i++) close(desc.objects[i].fd);
+
+    /* Skip vaRenderPicture/vaEndPicture — this test only exercises the
+     * export-layout decision, not a full encode cycle (that's covered by
+     * test_encode_one_frame() and friends elsewhere). */
+    vaDestroyBuffer(dpy, coded_buf);
+    vaDestroyContext(dpy, context);
+    vaDestroySurfaces(dpy, &surface, 1);
+    vaDestroyConfig(dpy, config);
+    TEST_PASS();
+}
+
 /* --- Test: Decode regression --- */
 
 static void test_decode_still_works(void)
@@ -1061,12 +1335,17 @@ int main(int argc, char **argv)
         printf("\nAV1 Encode:\n");
         test_av1_one_frame();
         test_av1_main10_one_frame();
+        test_av1_combined_rtformat_encode();
         test_av1_temporal_layers();
+        test_av1_temporal_svc_encode();
     }
 
     printf("\nStress:\n");
     test_sequential_encodes();
     test_coded_buffer_reuse();
+
+    printf("\nDescriptor mode (auto):\n");
+    test_encode_surface_export_auto_combined();
 
     printf("\nRegression:\n");
     test_decode_still_works();

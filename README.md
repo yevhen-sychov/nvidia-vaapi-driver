@@ -181,14 +181,90 @@ This fork includes the Chromium-compatible single-buffer export path. For Chrome
 
 ```sh
 LIBVA_DRIVER_NAME=nvidia google-chrome \
-  --enable-features=AcceleratedVideoDecodeLinuxGL,VaapiOnNvidiaGPUs \
+  --enable-features=AcceleratedVideoDecodeLinuxGL,AcceleratedVideoEncodeLinuxGL,VaapiOnNvidiaGPUs,VaapiVideoEncoder,VaapiIgnoreDriverChecks \
   --ignore-gpu-blocklist \
   --use-gl=angle --use-angle=gl
 ```
 
+To use hardware AV1 encoding you must pass the encode-related features
+(`AcceleratedVideoEncodeLinuxGL` / `VaapiVideoEncoder`) in addition to the decode
+ones — without them Chrome never probes the VA-API encoder and silently falls back
+to software `libaom`.
+
 On Wayland, also try `--ozone-platform=wayland` or `--ozone-platform-hint=auto`.
 
-`NVD_DESCRIPTOR_MODE` defaults to Chromium-compatible `single` mode in this branch. Use `NVD_DESCRIPTOR_MODE=multi` only when testing traditional per-plane export behavior.
+### WebRTC temporal scalability (screenshare)
+
+WebRTC screenshare uses temporal SVC (e.g. `scalabilityMode=L1T2`). This driver
+advertises temporal-layer support for AV1 (`VAConfigAttribEncRateControlExt`) and
+programs NVENC's temporal SVC from the layer structure supplied by the browser, so
+Chrome will use the hardware AV1 encoder instead of falling back to software. If you
+still see `encoderImplementation` reporting `libaom` in `chrome://webrtc-internals`,
+disable Chrome's software-fallback with `--disable-features=WebRtcAllowsSvcHardwareFallback`
+to surface the real encoder-selection result.
+
+> **Note:** if AV1 *decode* also regresses to software after enabling the encode
+> features, make sure you are running a driver build that resolves an ambiguous
+> `VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10` request to 8-bit. An earlier
+> build treated that combined mask as a 10-bit request, so an 8-bit AV1 encode
+> aborted mid-frame; that hard NVENC failure can crash the browser GPU process
+> and drop *all* hardware video (decode included) to software. Rebuild/reinstall
+> the driver (e.g. `update-nvenc.sh`) and restart the browser.
+
+### `NVD_DESCRIPTOR_MODE` (auto by default)
+
+By default (`NVD_DESCRIPTOR_MODE` unset, or explicitly `auto`) the driver picks
+the DMA-BUF export layout **per surface**, automatically, based on whether the
+surface belongs to an encode context or a decode context:
+
+- Encode-context surfaces (local screen/camera capture that Chrome's compositor
+  renders *into* via its WebGL/canvas "video-processing" worker path before
+  it's handed to NVENC) are exported as a single combined-fourcc layer (e.g.
+  NV12 with 2 planes).
+- Decode-context surfaces (the normal remote/received-video display path) are
+  exported as one split single-channel layer per plane (`R8`/`GR88`), which is
+  what Chromium's decode-display zero-copy importer expects.
+- A decode-context surface whose resolution exactly matches a currently-active
+  local encode context's resolution is also exported with the combined layer.
+  This covers Chrome re-decoding its own just-encoded stream to render a local
+  self-preview/thumbnail, which goes through the same WebGL/canvas worker
+  importer as an encode surface even though it is technically a decode
+  context — a genuine remote peer's video is essentially never encoded at the
+  exact same pixel dimensions as your own outgoing capture, so this heuristic
+  does not affect real inbound video.
+
+This matters because Chrome's two consumers of an exported DMA-BUF want
+different layouts on the same GPU/driver/ANGLE combination:
+
+> **EGL_BAD_MATCH / "requested LINUX_DRM_FORMAT is not supported":** if Chrome's
+> log is full of `eglCreateImageKHR: EGL_BAD_MATCH` errors together with
+> `OzoneImageBacking::ProduceSkiaGanesh failed to create GL representation` and
+> `CopySharedImage: unknown mailbox` (typically from a `RendererBlinkWorker`
+> raster/WebGL/canvas import, not the normal video display path), that's ANGLE's
+> NVIDIA DMA-BUF importer on that worker path rejecting the split per-plane
+> layout and only accepting the *combined* fourcc. The `auto` default handles
+> this for you on encode-context surfaces.
+
+If you need to force one layout for *every* surface (e.g. to test the
+traditional per-plane behavior, or because the automatic per-surface decision
+doesn't cover your specific workflow — see the caveat below), set
+`NVD_DESCRIPTOR_MODE` explicitly to `single` (split layer, single DMA-BUF
+object), `multi` (split layer, one DMA-BUF object per plane), or `combined`
+(single combined-fourcc layer, for every surface regardless of encode/decode).
+Check `NVD_LOG=1` for the `Descriptor mode: ...` line to confirm which mode is
+active.
+
+> **Known caveat:** the automatic decision is based on VA-API context type
+> (encode vs. decode) plus the resolution-matching heuristic above, which are
+> the only signals the driver has access to — there is no VA-API flag that
+> says "this decode is a local self-preview". In the unlikely case a decode
+> surface's resolution *happens* to coincide with an unrelated remote peer's
+> resolution, or a self-preview is rendered at a resolution that doesn't
+> exactly match the local encode context, this can still misclassify a
+> surface. If you find a specific decode surface still needs the combined
+> layout (or the opposite), forcing `NVD_DESCRIPTOR_MODE=combined`/`single`/
+> `multi` remains available as a manual override, at the cost of that mode's
+> known trade-off for the other surface type.
 
 ## MPV
 

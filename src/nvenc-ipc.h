@@ -60,6 +60,7 @@ typedef struct {
     uint32_t qualityLevel;
     uint32_t rcMode;
     uint32_t is10bit;       /* 0 = 8-bit NV12, 1 = 10-bit P010 */
+    uint32_t numTemporalLayers; /* temporal SVC layers, 0/1 = disabled */
 } NVEncIPCInitParams;
 
 /* CMD_ENCODE payload header (followed by frame_size bytes of NV12/P010 data) */

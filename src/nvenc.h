@@ -54,6 +54,7 @@ typedef struct {
     uint32_t                        maxWidth;
     uint32_t                        maxHeight;
     uint32_t                        temporalId;
+    uint32_t                        numTemporalLayers; //temporal SVC layers (0/1 = disabled)
     bool                            allowBframes;
 } NVENCContext;
 

@@ -49,7 +49,25 @@ typedef struct {
 
 typedef enum {
     DESCRIPTOR_MODE_MULTI,
-    DESCRIPTOR_MODE_SINGLE
+    DESCRIPTOR_MODE_SINGLE,
+    /* Like SINGLE, but exports YUV formats as a single combined-fourcc layer
+     * (e.g. NV12 with 2 planes) instead of one split single-channel layer per
+     * plane (R8 + GR88). Some EGL/ANGLE DMA-BUF importers (used by Chrome's
+     * WebGL/canvas "video-processing" worker path) only advertise support for
+     * the combined fourcc and reject the split-plane layout with
+     * EGL_BAD_MATCH. Decode-display paths keep working with SINGLE/MULTI;
+     * use COMBINED only to work around that importer. */
+    DESCRIPTOR_MODE_COMBINED,
+    /* Default mode: decide the layer layout per-surface instead of a single
+     * global choice. Encode-context surfaces (local capture/preview, which
+     * Chrome imports through the WebGL/canvas worker path) are exported with
+     * the COMBINED layout; decode-context surfaces (remote/video display,
+     * which needs the split per-plane layout) are exported like SINGLE. This
+     * lets a single Chrome session get correct rendering for both the local
+     * encode preview and remote decode without the user having to pick a
+     * mode manually. Explicitly setting NVD_DESCRIPTOR_MODE overrides this
+     * per-surface decision for every surface. */
+    DESCRIPTOR_MODE_AUTO
 } DescriptorMode;
 
 bool init_nvdriver(NVDriverContext *context, int drmFd);
