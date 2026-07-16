@@ -1,12 +1,14 @@
 # nvidia-vaapi-driver
 
-This is an VA-API implementation that uses NVDEC as a backend. This implementation is specifically designed to be used by Firefox for accelerated decode of web content, and may not operate correctly in other applications.
+This is an VA-API implementation that uses NVDEC as a decode backend and NVENC as an encode backend. The decode path is specifically designed to be used by Firefox for accelerated decode of web content, and may not operate correctly in other applications. This fork additionally implements hardware **video encoding** (H.264, HEVC and AV1) through NVENC.
 
 # Table of contents
 
 - [nvidia-vaapi-driver](#nvidia-vaapi-driver)
 - [Table of contents](#table-of-contents)
 - [Codec Support](#codec-support)
+  - [Decode Support](#decode-support)
+  - [Encode Support](#encode-support)
 - [Installation](#installation)
   - [Quick install from this fork](#quick-install-from-this-fork)
   - [Packaging status](#packaging-status)
@@ -19,12 +21,15 @@ This is an VA-API implementation that uses NVDEC as a backend. This implementati
   - [Firefox](#firefox)
   - [Chrome](#chrome)
   - [MPV](#mpv)
+  - [NVENC encode helper](#nvenc-encode-helper)
   - [Direct Backend](#direct-backend)
 - [Testing](#testing)
 
 # Codec Support
 
-Hardware decoding only, encoding is [not supported](/../../issues/116).
+This fork supports both hardware **decoding** (NVDEC) and hardware **encoding** (NVENC).
+
+## Decode Support
 
 | Codec | Supported | Comments |
 |---|---|---|
@@ -45,6 +50,19 @@ YUV444 is supported but requires:
 * Direct backend
 
 To view which codecs your card is capable of decoding you can use the `vainfo` command with this driver installed, or visit the NVIDIA website [here](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new#geforce).
+
+## Encode Support
+
+Hardware encoding is exposed through the VA-API `VAEntrypointEncSlice` entrypoint and is backed by NVENC. It becomes available when a usable NVENC engine is detected (either directly or via the [NVENC encode helper](#nvenc-encode-helper)).
+
+| Codec | Supported | Profiles | Comments |
+|---|---|---|---|
+|H.264|:heavy_check_mark:|Constrained Baseline, Main, High||
+|HEVC|:heavy_check_mark:|Main, Main10|Main10 enables 10-bit encoding.|
+|AV1|:heavy_check_mark:|Profile0|Requires an NVENC engine with AV1 encode support (Ada/Lovelace 40XX or newer).|
+|VP8 / VP9|:x:||Not supported by NVENC.|
+
+Actual encode capabilities depend on your GPU's NVENC generation. To view which codecs your card is capable of encoding you can use the `vainfo` command with this driver installed, or visit the NVIDIA [encode/decode support matrix](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new#geforce).
 
 # Installation
 
@@ -177,6 +195,20 @@ On Wayland, also try `--ozone-platform=wayland` or `--ozone-platform-hint=auto`.
 Currently this only works with a recent MPV version (at least 0.36.0).
 
 There's no real reason to run it with mpv except for testing, as mpv already supports using nvdec directly. The `test.sh` script will run mpv with the file provided and various environment variables set to use the newly built driver
+
+## NVENC encode helper
+
+Hardware encoding uses NVENC. When the driver can initialise CUDA/NVENC in-process, encoding works directly with no extra setup. In environments where the process that loads the driver cannot talk to NVENC directly (for example sandboxed browser processes), the driver falls back to an out-of-process helper that performs the encode over an IPC channel.
+
+The helper is shipped as a user systemd service (`nvenc-helper.service`) and is installed to `/usr/libexec/nvenc-helper`. Enable and start it with:
+
+```sh
+systemctl --user enable --now nvenc-helper.service
+```
+
+After rebuilding the driver you can update and restart the helper via the provided `update-nvenc.sh` script (it builds the 64-bit and 32-bit driver, installs them, and restarts the helper service).
+
+The helper honours the `NVENC_HELPER_IDR_INTERVAL` environment variable to control the IDR/keyframe interval.
 
 ## Direct Backend
 
