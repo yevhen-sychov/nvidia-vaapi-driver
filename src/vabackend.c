@@ -597,6 +597,17 @@ static bool destroyContext(NVDriver *drv, NVContext *nvCtx) {
                     nvencCtx->ipcFd = -1;
                 }
             } else {
+                /* Release the persistent linear staging buffer/registration
+                 * before tearing down the encoder session. */
+                if (nvencCtx->registeredRes != NULL) {
+                    nvenc_unregister_resource(nvencCtx, nvencCtx->registeredRes);
+                    nvencCtx->registeredRes = NULL;
+                }
+                if (nvencCtx->linearBuffer != 0) {
+                    cu->cuMemFree(nvencCtx->linearBuffer);
+                    nvencCtx->linearBuffer = 0;
+                    nvencCtx->linearBufferSize = 0;
+                }
                 nvenc_close_session(nvencCtx);
             }
             free(nvencCtx);
@@ -3679,13 +3690,55 @@ static VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx)
     uint32_t chromaSize = pitch * (encHeight / 2);
     uint32_t totalSize = lumaSize + chromaSize;
 
-    CUdeviceptr linearBuffer = 0;
-    CUresult cuRes = cu->cuMemAlloc(&linearBuffer, totalSize);
-    if (cuRes != CUDA_SUCCESS) {
-        LOG("Encode: failed to allocate linear buffer (%u bytes): %d", totalSize, cuRes);
-        CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
-        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    /*
+     * Reuse a persistent linear staging buffer + NVENC-registered resource for
+     * the lifetime of the session instead of allocating/registering (and
+     * freeing/unregistering) new ones on every single frame. Repeatedly
+     * churning CUDA device memory allocations and NVENC resource registrations
+     * was found to gradually destabilize long-running encode sessions,
+     * eventually crashing the GPU process after a few minutes.
+     */
+    if (nvencCtx->registeredRes != NULL &&
+        (nvencCtx->linearBufferSize < totalSize ||
+         nvencCtx->registeredWidth != encWidth ||
+         nvencCtx->registeredHeight != encHeight ||
+         nvencCtx->registeredPitch != pitch)) {
+        /* Resolution/format changed: drop the old buffer/registration */
+        nvenc_unregister_resource(nvencCtx, nvencCtx->registeredRes);
+        nvencCtx->registeredRes = NULL;
+        cu->cuMemFree(nvencCtx->linearBuffer);
+        nvencCtx->linearBuffer = 0;
+        nvencCtx->linearBufferSize = 0;
     }
+
+    if (nvencCtx->linearBuffer == 0) {
+        CUresult cuRes = cu->cuMemAlloc(&nvencCtx->linearBuffer, totalSize);
+        if (cuRes != CUDA_SUCCESS) {
+            LOG("Encode: failed to allocate linear buffer (%u bytes): %d", totalSize, cuRes);
+            CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        nvencCtx->linearBufferSize = totalSize;
+    }
+
+    if (nvencCtx->registeredRes == NULL) {
+        if (!nvenc_register_cuda_resource(nvencCtx, nvencCtx->linearBuffer,
+                                          encWidth, encHeight, pitch,
+                                          encFmt, &nvencCtx->registeredRes)) {
+            cu->cuMemFree(nvencCtx->linearBuffer);
+            nvencCtx->linearBuffer = 0;
+            nvencCtx->linearBufferSize = 0;
+            CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+        nvencCtx->registeredWidth = encWidth;
+        nvencCtx->registeredHeight = encHeight;
+        nvencCtx->registeredPitch = pitch;
+    }
+
+    CUdeviceptr linearBuffer = nvencCtx->linearBuffer;
+    NV_ENC_REGISTERED_PTR registeredRes = nvencCtx->registeredRes;
+    CUresult cuRes;
 
     /* Zero the buffer so padded rows are clean */
     cu->cuMemsetD8Async(linearBuffer, 0, totalSize, 0);
@@ -3703,7 +3756,6 @@ static VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx)
     cuRes = cu->cuMemcpy2D(&copy);
     if (cuRes != CUDA_SUCCESS) {
         LOG("Encode: luma copy failed: %d (surface=%ux%u, pitch=%u)", cuRes, surfWidth, surfHeight, pitch);
-        cu->cuMemFree(linearBuffer);
         CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
@@ -3722,27 +3774,14 @@ static VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx)
     cuRes = cu->cuMemcpy2D(&copy);
     if (cuRes != CUDA_SUCCESS) {
         LOG("Encode: chroma copy failed: %d", cuRes);
-        cu->cuMemFree(linearBuffer);
         CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    /* Register the linear buffer with NVENC */
-    NV_ENC_REGISTERED_PTR registeredRes = NULL;
-    if (!nvenc_register_cuda_resource(nvencCtx, linearBuffer,
-                                      encWidth, encHeight, pitch,
-                                      encFmt, &registeredRes)) {
-        cu->cuMemFree(linearBuffer);
-        CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
-        return VA_STATUS_ERROR_OPERATION_FAILED;
-    }
-
-    /* Map the registered resource */
+    /* Map the persistent registered resource for this frame */
     NV_ENC_INPUT_PTR mappedResource = NULL;
     NV_ENC_BUFFER_FORMAT mappedFmt = encFmt;
     if (!nvenc_map_resource(nvencCtx, registeredRes, &mappedResource, &mappedFmt)) {
-        nvenc_unregister_resource(nvencCtx, registeredRes);
-        cu->cuMemFree(linearBuffer);
         CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
@@ -3757,10 +3796,9 @@ static VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx)
                                        encWidth, encHeight, pitch,
                                        nvencCtx->picType, picFlags);
 
-    /* Unmap and unregister regardless of encode result */
+    /* Unmap only - the buffer/registration itself is kept for reuse on the
+     * next frame and released only when the encode context is destroyed. */
     nvenc_unmap_resource(nvencCtx, mappedResource);
-    nvenc_unregister_resource(nvencCtx, registeredRes);
-    cu->cuMemFree(linearBuffer);
 
     if (encResult < 0) {
         CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));

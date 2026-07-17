@@ -97,6 +97,13 @@ void nvenc_close_session(NVENCContext *nvencCtx)
     /* Free output buffer after flush */
     nvenc_free_output_buffer(nvencCtx);
 
+    /*
+     * The persistent linear staging buffer/registered resource (if any) is
+     * owned by CUDA device memory allocated in vabackend.c (which has access
+     * to the CUDA function table) and is released by the caller via
+     * nvenc_release_linear_buffer() before this function destroys the encoder.
+     */
+
     /* Destroy encoder */
     NVENCSTATUS st = nvencCtx->funcs.nvEncDestroyEncoder(nvencCtx->encoder);
     if (st != NV_ENC_SUCCESS) {

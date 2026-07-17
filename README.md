@@ -266,6 +266,21 @@ active.
 > `multi` remains available as a manual override, at the cost of that mode's
 > known trade-off for the other surface type.
 
+### Encoder restart delay after stopping/switching screenshare
+
+If you stop sharing a screen (or switch the active shared window/source) and
+the outgoing video appears frozen on one frame for a short period afterwards,
+this is expected and not a driver issue. Chrome tears down the old encode
+context and DMA-BUF surfaces (visible in `NVD_LOG=1` as `nvDestroyContext` /
+`nvenc_close_session` / `nvDestroySurfaces`) and has to negotiate/create a new
+encode context for the new source before frames start flowing again; this
+teardown/recreate cycle takes Chrome some time on its own. Similarly, a
+`SharedImageManager::ProduceSkia: ... non-existent mailbox` message logged a
+while after such a stop/switch (with no adjacent driver `EGL_BAD_MATCH` or
+`Exporting surface descriptor` line) is Chrome's own GPU-process mailbox
+bookkeeping settling after that teardown, not a surface/format problem from
+this driver.
+
 ## MPV
 
 Currently this only works with a recent MPV version (at least 0.36.0).

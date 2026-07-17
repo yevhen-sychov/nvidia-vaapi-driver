@@ -56,6 +56,19 @@ typedef struct {
     uint32_t                        temporalId;
     uint32_t                        numTemporalLayers; //temporal SVC layers (0/1 = disabled)
     bool                            allowBframes;
+    /*
+     * Persistent linear staging buffer + NVENC-registered resource, reused across
+     * frames for the lifetime of the session instead of being allocated/registered
+     * and freed/unregistered on every single frame. Repeatedly churning device
+     * memory allocations and NVENC resource registrations was found to gradually
+     * destabilize long-running encode sessions (crash after a few minutes).
+     */
+    CUdeviceptr                     linearBuffer;
+    uint32_t                        linearBufferSize;
+    NV_ENC_REGISTERED_PTR           registeredRes;
+    uint32_t                        registeredWidth;
+    uint32_t                        registeredHeight;
+    uint32_t                        registeredPitch;
 } NVENCContext;
 
 // Wraps VACodedBufferSegment with NVENC bitstream storage

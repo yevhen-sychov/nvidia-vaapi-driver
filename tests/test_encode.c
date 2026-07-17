@@ -1078,6 +1078,94 @@ cleanup:
     vaDestroyConfig(dpy, config);
 }
 
+/* --- Test: many frames within a single long-running encode session --- */
+
+/* Regression test for a crash reported after a few minutes of real-world
+ * WebRTC H.264 encoding: the driver used to allocate/register a fresh CUDA
+ * linear staging buffer + NVENC resource on every single frame and free/
+ * unregister it again afterwards. That per-frame churn (hundreds/thousands
+ * of allocations over a real call) destabilized the encode session and
+ * crashed the process. The fix reuses one persistent buffer/registration for
+ * the whole session. This test drives many more frames through a single
+ * context than the other stress tests to exercise that reuse path. */
+static void test_long_running_single_session(void)
+{
+    TEST_START("200 frames in a single long-running H.264 session (crash regression)");
+
+    VAConfigAttrib attrib = { .type = VAConfigAttribRTFormat,
+                               .value = VA_RT_FORMAT_YUV420 };
+    VAConfigID config;
+    vaCreateConfig(dpy, VAProfileH264High, VAEntrypointEncSlice,
+                    &attrib, 1, &config);
+    VASurfaceID surface;
+    vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, 1920, 1088, &surface, 1, NULL, 0);
+    VAContextID context;
+    vaCreateContext(dpy, config, 1920, 1088, VA_PROGRESSIVE, &surface, 1, &context);
+    VABufferID coded;
+    vaCreateBuffer(dpy, context, VAEncCodedBufferType, 1920 * 1088, 1, NULL, &coded);
+
+    const int numFrames = 200;
+    for (int frame = 0; frame < numFrames; frame++) {
+        VAEncSequenceParameterBufferH264 seq = {
+            .picture_width_in_mbs = 120, .picture_height_in_mbs = 68,
+            .intra_period = 0, .ip_period = 1,
+        };
+        VAEncPictureParameterBufferH264 pic = {
+            .coded_buf = coded,
+            .pic_fields.bits.idr_pic_flag = (frame == 0) ? 1 : 0,
+        };
+        VAEncSliceParameterBufferH264 slice = {
+            .slice_type = (frame == 0) ? 2 : 0,
+        };
+        VAEncMiscParameterBuffer *miscBuf;
+        VABufferID bufs[4];
+        vaCreateBuffer(dpy, context, VAEncSequenceParameterBufferType,
+                        sizeof(seq), 1, &seq, &bufs[0]);
+        vaCreateBuffer(dpy, context, VAEncPictureParameterBufferType,
+                        sizeof(pic), 1, &pic, &bufs[1]);
+        vaCreateBuffer(dpy, context, VAEncSliceParameterBufferType,
+                        sizeof(slice), 1, &slice, &bufs[2]);
+
+        /* Mimic real-world Chrome behaviour: resend rate-control/framerate
+         * misc params on every single frame, matching the reported crash log. */
+        size_t miscSize = sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl);
+        vaCreateBuffer(dpy, context, VAEncMiscParameterBufferType,
+                        miscSize, 1, NULL, &bufs[3]);
+        vaMapBuffer(dpy, bufs[3], (void **)&miscBuf);
+        miscBuf->type = VAEncMiscParameterTypeRateControl;
+        VAEncMiscParameterRateControl *rc = (VAEncMiscParameterRateControl*) miscBuf->data;
+        rc->bits_per_second = 4000000;
+        rc->target_percentage = 100;
+        vaUnmapBuffer(dpy, bufs[3]);
+
+        vaBeginPicture(dpy, context, surface);
+        vaRenderPicture(dpy, context, bufs, 4);
+        VAStatus st = vaEndPicture(dpy, context);
+        if (st != VA_STATUS_SUCCESS) {
+            TEST_FAIL("vaEndPicture failed on frame");
+            goto cleanup;
+        }
+
+        VACodedBufferSegment *seg;
+        vaMapBuffer(dpy, coded, (void **)&seg);
+        if (!seg || !seg->buf || seg->size == 0) {
+            TEST_FAIL("empty coded buffer");
+            vaUnmapBuffer(dpy, coded);
+            goto cleanup;
+        }
+        vaUnmapBuffer(dpy, coded);
+
+        for (int i = 0; i < 4; i++) vaDestroyBuffer(dpy, bufs[i]);
+    }
+    TEST_PASS();
+
+cleanup:
+    vaDestroyBuffer(dpy, coded);
+    vaDestroyContext(dpy, context);
+    vaDestroySurfaces(dpy, &surface, 1);
+    vaDestroyConfig(dpy, config);
+}
+
 /* --- Test: automatic descriptor mode (NVD_DESCRIPTOR_MODE unset/auto) --- */
 
 /* With NVD_DESCRIPTOR_MODE left unset (the default AUTO mode), surfaces that
@@ -1343,6 +1431,7 @@ int main(int argc, char **argv)
     printf("\nStress:\n");
     test_sequential_encodes();
     test_coded_buffer_reuse();
+    test_long_running_single_session();
 
     printf("\nDescriptor mode (auto):\n");
     test_encode_surface_export_auto_combined();
