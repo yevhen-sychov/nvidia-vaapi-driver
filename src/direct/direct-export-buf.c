@@ -576,8 +576,10 @@ static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surfa
 
     LOG_DEBUG("Allocating BackingImages: %p %dx%d", backingImage, surface->width, surface->height);
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-        alloc_image(&drv->driverContext, surface->width >> p[i].ss.x, surface->height >> p[i].ss.y,
-                    p[i].channelCount, 8 * fmtInfo->bppc, p[i].fourcc, &driverImages[i]);
+        if (!alloc_image(&drv->driverContext, surface->width >> p[i].ss.x, surface->height >> p[i].ss.y,
+                         p[i].channelCount, 8 * fmtInfo->bppc, p[i].fourcc, &driverImages[i])) {
+            goto bail;
+        }
     }
 
     /* Import into CUDA only when CUDA is available.
@@ -615,8 +617,9 @@ static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surfa
     return backingImage;
 
 bail:
-    //another 'free' might occur on this pointer.
-    //hence, set it to NULL to ensure no operation is performed if this really happens.
+    // Close the not-yet-transferred driver fds, then let destroyBackingImage
+    // release any CUDA arrays/external-memory already imported by import_to_cuda
+    // and the sync mutex/cond -- a plain free() here leaked all of those.
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         if (driverImages[i].nvFd != 0) {
             close(driverImages[i].nvFd);
@@ -630,7 +633,7 @@ bail:
     }
 
     if (backingImage != NULL) {
-        free(backingImage);
+        destroyBackingImage(drv, backingImage);
     }
 
     return NULL;
@@ -735,9 +738,19 @@ static void direct_detachBackingImageFromSurface(NVDriver *drv, NVSurface *surfa
         return;
     }
 
+    // Publish the detach (surface -> NULL) and assign the detached serial while
+    // holding imagesMutex. The prune path reads both under the same lock to pick
+    // the oldest reclaimable image; doing it unlocked exposes a window where a
+    // just-detached image (serial not yet written, still 0) looks like the
+    // oldest and gets reclaimed first -- exactly the most-recently-detached
+    // image whose exported dma-buf is most likely still in the client's
+    // pipeline, which is the corruption the oldest-first prune exists to avoid.
+    pthread_mutex_lock(&drv->imagesMutex);
     surface->backingImage->surface = NULL;
     surface->backingImage->detachedSerial = ++drv->detachedBackingImageSerial;
     surface->backingImage = NULL;
+    pthread_mutex_unlock(&drv->imagesMutex);
+
     pruneDetachedBackingImagesToLimits(drv);
 }
 
