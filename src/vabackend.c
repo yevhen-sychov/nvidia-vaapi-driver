@@ -619,7 +619,13 @@ static bool destroyContext(NVDriver *drv, NVContext *nvCtx) {
         return true;
     }
 
-    if (nvCtx->decoder != NULL) {
+    // Join on whether the resolve thread was actually started, not on decoder !=
+    // NULL: a decode context whose decoder was destroyed and failed to recreate
+    // (recreateDecoderForSurface) leaves decoder == NULL with the resolve thread
+    // still running. Guarding on decoder would skip the join and free nvCtx out
+    // from under the live thread. VideoProc contexts never start the thread, so
+    // the flag stays false for them.
+    if (nvCtx->resolveThreadStarted) {
         LOG("Signaling resolve thread to exit");
         struct timespec timeout;
         clock_gettime(CLOCK_REALTIME, &timeout);
@@ -2323,8 +2329,6 @@ static VAStatus nvCreateContext(
     }
 
     CUVIDDECODECREATEINFO vdci = {
-        .ulWidth             = vdci.ulMaxWidth  = vdci.ulTargetWidth  = picture_width,
-        .ulHeight            = vdci.ulMaxHeight = vdci.ulTargetHeight = picture_height,
         .CodecType           = cfg->cudaCodec,
         .ulCreationFlags     = cudaVideoCreate_PreferCUVID,
         .ulIntraDecodeOnly   = 0, //TODO (flag & VA_PROGRESSIVE) != 0
@@ -2342,6 +2346,8 @@ static VAStatus nvCreateContext(
         .ulNumDecodeSurfaces = surfaceCount,
         //.vidLock             = drv->vidLock
     };
+    vdci.ulWidth = vdci.ulMaxWidth = vdci.ulTargetWidth = picture_width;
+    vdci.ulHeight = vdci.ulMaxHeight = vdci.ulTargetHeight = picture_height;
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
 
@@ -2382,6 +2388,7 @@ static VAStatus nvCreateContext(
         deleteObject(drv, contextObj->id);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
+    nvCtx->resolveThreadStarted = true;
 
     *context = contextObj->id;
 
@@ -2442,8 +2449,6 @@ static VAStatus recreateDecoderForSurface(NVContext *nvCtx, NVSurface *surface) 
     }
 
     CUVIDDECODECREATEINFO vdci = {
-        .ulWidth             = vdci.ulMaxWidth  = vdci.ulTargetWidth  = nvCtx->width,
-        .ulHeight            = vdci.ulMaxHeight = vdci.ulTargetHeight = nvCtx->height,
         .CodecType           = nvCtx->cudaCodec,
         .ulCreationFlags     = cudaVideoCreate_PreferCUVID,
         .ulIntraDecodeOnly   = 0,
@@ -2456,6 +2461,8 @@ static VAStatus recreateDecoderForSurface(NVContext *nvCtx, NVSurface *surface) 
         .ulNumOutputSurfaces = 1,
         .ulNumDecodeSurfaces = nvCtx->surfaceCount,
     };
+    vdci.ulWidth = vdci.ulMaxWidth = vdci.ulTargetWidth = nvCtx->width;
+    vdci.ulHeight = vdci.ulMaxHeight = vdci.ulTargetHeight = nvCtx->height;
 
     NVDriver *drv = nvCtx->drv;
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
