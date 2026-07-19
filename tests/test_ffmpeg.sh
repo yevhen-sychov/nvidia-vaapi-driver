@@ -3,8 +3,8 @@ set -u
 
 export LIBVA_DRIVER_NAME=nvidia
 
-# INPUT_FILE can be passed as argument, default to tests/input.mp4
-INPUT_FILE=${1:-tests/input.mp4}
+# INPUT_FILE can be passed as argument, default to samples/input.mp4
+INPUT_FILE=${1:-samples/input.mp4}
 
 if [ ! -f "$INPUT_FILE" ]; then
     echo "Input file $INPUT_FILE not found"
