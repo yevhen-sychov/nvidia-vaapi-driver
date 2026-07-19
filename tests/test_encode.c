@@ -1166,6 +1166,466 @@ cleanup:
     vaDestroyConfig(dpy, config);
 }
 
+/* Fill an NV12 image with "natural-looking" content: a smoothly translating
+ * gradient (compressible under a generous bit budget, i.e. small frame sizes
+ * at high target bitrate) with a moving high-contrast block that shifts each
+ * frame (real motion and detail for P-frames to code, which balloons frame
+ * sizes when the rate controller is starved and cannot afford quality
+ * anymore). Pure random noise is uncompressible so CBR just outputs at the
+ * quality floor regardless of target bps -- useless for distinguishing
+ * "reconfigure applied" from "reconfigure ignored". A smooth+detail mix
+ * gives the rate controller headroom to actually differentiate. */
+static void fill_nv12_image_variable(VAImage *img, int frame)
+{
+    unsigned char *base = NULL;
+    if (vaMapBuffer(dpy, img->buf, (void **)&base) != VA_STATUS_SUCCESS) {
+        return;
+    }
+    unsigned char *y = base + img->offsets[0];
+    const uint32_t detailPos = (uint32_t)(frame * 3) % (img->width - 128);
+    for (uint32_t row = 0; row < img->height; row++) {
+        unsigned char *rowp = y + (size_t)row * img->pitches[0];
+        for (uint32_t col = 0; col < img->width; col++) {
+            /* Smooth gradient base */
+            unsigned int v = (col + row + frame * 2) & 0xff;
+            /* Sharp detail block that moves each frame */
+            if (col >= detailPos && col < detailPos + 128 &&
+                row >= img->height / 4 && row < img->height * 3 / 4) {
+                v ^= ((col ^ row ^ frame) * 131) & 0xff;
+            }
+            rowp[col] = (unsigned char)v;
+        }
+    }
+    unsigned char *uv = base + img->offsets[1];
+    for (uint32_t row = 0; row < img->height / 2; row++) {
+        unsigned char *rowp = uv + (size_t)row * img->pitches[1];
+        for (uint32_t col = 0; col < img->width / 2; col++) {
+            rowp[col * 2 + 0] = (unsigned char)((col + frame) & 0xff);
+            rowp[col * 2 + 1] = (unsigned char)((row + frame * 2) & 0xff);
+        }
+    }
+    vaUnmapBuffer(dpy, img->buf);
+}
+
+/* --- Test: bitrate change mid-session is applied via nvEncReconfigureEncoder --- */
+
+/* Regression test for a WebRTC BWE issue observed in Chrome: the codec-specific
+ * misc-param handlers recorded new bits_per_second into NVENCContext but never
+ * applied it to the running encoder, so BWE bitrate reductions were silently
+ * ignored. The encoder kept emitting at the initial rate (~19x the requested
+ * one in a real trace), saturating the peer connection and freezing playback.
+ *
+ * This test drives the same VA-API sequence a browser would: encode N frames
+ * at a high bitrate, push a rate-control misc-param that drops the target
+ * roughly 10x, then encode another N frames. If the reconfigure actually
+ * happens, the second batch's average frame size is meaningfully smaller than
+ * the first batch's. If it didn't, both averages would land in the same range.
+ */
+static void test_bitrate_reconfigure_mid_session(void)
+{
+    TEST_START("Bitrate change mid-session reconfigures NVENC (BWE regression)");
+
+    VAConfigAttrib attribs[2] = {
+        { .type = VAConfigAttribRTFormat,   .value = VA_RT_FORMAT_YUV420 },
+        { .type = VAConfigAttribRateControl, .value = VA_RC_CBR },
+    };
+    VAConfigID config;
+    VAStatus st = vaCreateConfig(dpy, VAProfileH264High, VAEntrypointEncSlice,
+                                  attribs, 2, &config);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "config");
+
+    const uint32_t W = 1280, H = 720;
+    VASurfaceID surface;
+    vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, W, H, &surface, 1, NULL, 0);
+    VAContextID context;
+    vaCreateContext(dpy, config, W, H, VA_PROGRESSIVE, &surface, 1, &context);
+    VABufferID coded;
+    vaCreateBuffer(dpy, context, VAEncCodedBufferType, W * H, 1, NULL, &coded);
+
+    /* Reusable NV12 upload staging image: without varying pixel content the
+     * encoder happily codes an all-zero frame down to ~40 bytes at any bitrate
+     * and the assertions below become vacuous. */
+    VAImageFormat fmt = { .fourcc = VA_FOURCC_NV12 };
+    VAImage image;
+    vaCreateImage(dpy, &fmt, W, H, &image);
+
+    /* Warm-up + high-bitrate window, then low-bitrate window. Warm-up frames
+     * absorb the initial IDR + rate-control convergence so their sizes don't
+     * skew the averages. */
+    const int WARMUP = 5;
+    const int WINDOW = 25;
+    const uint32_t HIGH_BPS = 8000000; /* 8 Mbps */
+    const uint32_t LOW_BPS  = 400000;  /* 0.4 Mbps -- 20x drop */
+
+    uint64_t highSum = 0, lowSum = 0;
+    int highSamples = 0, lowSamples = 0;
+    const int totalFrames = WARMUP + WINDOW + WINDOW;
+
+    for (int frame = 0; frame < totalFrames; frame++) {
+        fill_nv12_image_variable(&image, frame);
+        vaPutImage(dpy, surface, image.image_id, 0, 0, W, H, 0, 0, W, H);
+
+        VAEncSequenceParameterBufferH264 seq = {
+            .picture_width_in_mbs = W / 16, .picture_height_in_mbs = H / 16,
+            .intra_period = 0, .ip_period = 1,
+            .bits_per_second = HIGH_BPS,
+        };
+        VAEncPictureParameterBufferH264 pic = {
+            .coded_buf = coded,
+            .pic_fields.bits.idr_pic_flag = (frame == 0) ? 1 : 0,
+        };
+        VAEncSliceParameterBufferH264 slice = {
+            .slice_type = (frame == 0) ? 2 : 0,
+        };
+
+        /* Switch to low bitrate as the transition frame between the two
+         * windows -- Chrome resends rate-control every frame in practice. */
+        const uint32_t bps = (frame < WARMUP + WINDOW) ? HIGH_BPS : LOW_BPS;
+
+        VABufferID bufs[4];
+        vaCreateBuffer(dpy, context, VAEncSequenceParameterBufferType,
+                        sizeof(seq), 1, &seq, &bufs[0]);
+        vaCreateBuffer(dpy, context, VAEncPictureParameterBufferType,
+                        sizeof(pic), 1, &pic, &bufs[1]);
+        vaCreateBuffer(dpy, context, VAEncSliceParameterBufferType,
+                        sizeof(slice), 1, &slice, &bufs[2]);
+
+        size_t miscSize = sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl);
+        vaCreateBuffer(dpy, context, VAEncMiscParameterBufferType,
+                        miscSize, 1, NULL, &bufs[3]);
+        VAEncMiscParameterBuffer *miscBuf;
+        vaMapBuffer(dpy, bufs[3], (void **)&miscBuf);
+        miscBuf->type = VAEncMiscParameterTypeRateControl;
+        VAEncMiscParameterRateControl *rc = (VAEncMiscParameterRateControl*) miscBuf->data;
+        rc->bits_per_second = bps;
+        rc->target_percentage = 100;
+        vaUnmapBuffer(dpy, bufs[3]);
+
+        vaBeginPicture(dpy, context, surface);
+        vaRenderPicture(dpy, context, bufs, 4);
+        VAStatus est = vaEndPicture(dpy, context);
+        if (est != VA_STATUS_SUCCESS) {
+            TEST_FAIL("vaEndPicture failed mid-session");
+            goto cleanup;
+        }
+
+        VACodedBufferSegment *seg;
+        vaMapBuffer(dpy, coded, (void **)&seg);
+        if (!seg || !seg->buf || seg->size == 0) {
+            TEST_FAIL("empty coded buffer");
+            vaUnmapBuffer(dpy, coded);
+            goto cleanup;
+        }
+
+        if (frame >= WARMUP && frame < WARMUP + WINDOW) {
+            highSum += seg->size;
+            highSamples++;
+        } else if (frame >= WARMUP + WINDOW) {
+            lowSum += seg->size;
+            lowSamples++;
+        }
+        vaUnmapBuffer(dpy, coded);
+
+        for (int i = 0; i < 4; i++) vaDestroyBuffer(dpy, bufs[i]);
+    }
+
+    if (highSamples == 0 || lowSamples == 0) {
+        TEST_FAIL("no samples collected");
+        goto cleanup;
+    }
+
+    const double highAvg = (double)highSum / highSamples;
+    const double lowAvg  = (double)lowSum  / lowSamples;
+
+    /* At a 20x target-bitrate drop we expect the low-window average to be at
+     * least 3x smaller than the high-window average. This tolerance survives
+     * rate-control convergence noise and quality-preserving VBV behaviour but
+     * catches the "reconfigure never happens" regression, where both averages
+     * would land in the same order of magnitude. */
+    if (lowAvg > highAvg / 3.0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "bitrate change not applied: highAvg=%.0f B, lowAvg=%.0f B (need lowAvg < highAvg/3)",
+                 highAvg, lowAvg);
+        TEST_FAIL(msg);
+        goto cleanup;
+    }
+
+    TEST_PASS();
+
+cleanup:
+    vaDestroyImage(dpy, image.image_id);
+    vaDestroyBuffer(dpy, coded);
+    vaDestroyContext(dpy, context);
+    vaDestroySurfaces(dpy, &surface, 1);
+    vaDestroyConfig(dpy, config);
+}
+
+/* --- Test: repeated bitrate changes each get applied --- */
+
+/* Chrome pushes a fresh rate-control misc-param on every single frame in the
+ * traces we've captured, and BWE frequently ramps the target up and down. This
+ * verifies each direction of change is honoured -- not just "one change once".
+ * If reconfigure only worked on the very first change (e.g. a stale-value
+ * check compared the wrong field) the ramp-up would fail this test. */
+static void test_bitrate_reconfigure_ramp_down_and_up(void)
+{
+    TEST_START("Repeated bitrate changes (down then up) each take effect");
+
+    VAConfigAttrib attribs[2] = {
+        { .type = VAConfigAttribRTFormat,   .value = VA_RT_FORMAT_YUV420 },
+        { .type = VAConfigAttribRateControl, .value = VA_RC_CBR },
+    };
+    VAConfigID config;
+    VAStatus st = vaCreateConfig(dpy, VAProfileH264High, VAEntrypointEncSlice,
+                                  attribs, 2, &config);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "config");
+
+    const uint32_t W = 1280, H = 720;
+    VASurfaceID surface;
+    vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, W, H, &surface, 1, NULL, 0);
+    VAContextID context;
+    vaCreateContext(dpy, config, W, H, VA_PROGRESSIVE, &surface, 1, &context);
+    VABufferID coded;
+    vaCreateBuffer(dpy, context, VAEncCodedBufferType, W * H, 1, NULL, &coded);
+
+    VAImageFormat fmt = { .fourcc = VA_FOURCC_NV12 };
+    VAImage image;
+    vaCreateImage(dpy, &fmt, W, H, &image);
+
+    const int WARMUP = 5;
+    const int WINDOW = 20;
+    const uint32_t HIGH_BPS = 6000000;
+    const uint32_t LOW_BPS  = 500000;
+
+    uint64_t sum[3] = {0, 0, 0};    /* high, low, high-again */
+    int      cnt[3] = {0, 0, 0};
+
+    /* Three windows: high, low, high. All prefixed by WARMUP frames each. */
+    const int perStage = WARMUP + WINDOW;
+    const int totalFrames = 3 * perStage;
+
+    for (int frame = 0; frame < totalFrames; frame++) {
+        fill_nv12_image_variable(&image, frame);
+        vaPutImage(dpy, surface, image.image_id, 0, 0, W, H, 0, 0, W, H);
+
+        const int stage = frame / perStage;
+        const int stageFrame = frame % perStage;
+        const uint32_t bps = (stage == 1) ? LOW_BPS : HIGH_BPS;
+
+        VAEncSequenceParameterBufferH264 seq = {
+            .picture_width_in_mbs = W / 16, .picture_height_in_mbs = H / 16,
+            .intra_period = 0, .ip_period = 1,
+        };
+        VAEncPictureParameterBufferH264 pic = {
+            .coded_buf = coded,
+            .pic_fields.bits.idr_pic_flag = (frame == 0) ? 1 : 0,
+        };
+        VAEncSliceParameterBufferH264 slice = {
+            .slice_type = (frame == 0) ? 2 : 0,
+        };
+
+        VABufferID bufs[4];
+        vaCreateBuffer(dpy, context, VAEncSequenceParameterBufferType,
+                        sizeof(seq), 1, &seq, &bufs[0]);
+        vaCreateBuffer(dpy, context, VAEncPictureParameterBufferType,
+                        sizeof(pic), 1, &pic, &bufs[1]);
+        vaCreateBuffer(dpy, context, VAEncSliceParameterBufferType,
+                        sizeof(slice), 1, &slice, &bufs[2]);
+
+        size_t miscSize = sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl);
+        vaCreateBuffer(dpy, context, VAEncMiscParameterBufferType,
+                        miscSize, 1, NULL, &bufs[3]);
+        VAEncMiscParameterBuffer *miscBuf;
+        vaMapBuffer(dpy, bufs[3], (void **)&miscBuf);
+        miscBuf->type = VAEncMiscParameterTypeRateControl;
+        VAEncMiscParameterRateControl *rc = (VAEncMiscParameterRateControl*) miscBuf->data;
+        rc->bits_per_second = bps;
+        rc->target_percentage = 100;
+        vaUnmapBuffer(dpy, bufs[3]);
+
+        vaBeginPicture(dpy, context, surface);
+        vaRenderPicture(dpy, context, bufs, 4);
+        VAStatus est = vaEndPicture(dpy, context);
+        if (est != VA_STATUS_SUCCESS) {
+            TEST_FAIL("vaEndPicture failed during ramp");
+            goto cleanup;
+        }
+
+        VACodedBufferSegment *seg;
+        vaMapBuffer(dpy, coded, (void **)&seg);
+        if (!seg || !seg->buf || seg->size == 0) {
+            TEST_FAIL("empty coded buffer during ramp");
+            vaUnmapBuffer(dpy, coded);
+            goto cleanup;
+        }
+        if (stageFrame >= WARMUP) {
+            sum[stage] += seg->size;
+            cnt[stage]++;
+        }
+        vaUnmapBuffer(dpy, coded);
+
+        for (int i = 0; i < 4; i++) vaDestroyBuffer(dpy, bufs[i]);
+    }
+
+    if (cnt[0] == 0 || cnt[1] == 0 || cnt[2] == 0) {
+        TEST_FAIL("missing samples in ramp windows");
+        goto cleanup;
+    }
+
+    const double highAvg     = (double)sum[0] / cnt[0];
+    const double lowAvg      = (double)sum[1] / cnt[1];
+    const double highAgainAvg = (double)sum[2] / cnt[2];
+
+    /* Ramp-down must halve at least: catches "reconfigure ignored". */
+    if (lowAvg > highAvg / 2.0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "ramp-down not applied: high=%.0f low=%.0f", highAvg, lowAvg);
+        TEST_FAIL(msg);
+        goto cleanup;
+    }
+    /* Ramp-up must recover to at least 2x the low-window average: catches
+     * "reconfigure only takes the first change". */
+    if (highAgainAvg < lowAvg * 2.0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "ramp-up not applied: low=%.0f high-again=%.0f", lowAvg, highAgainAvg);
+        TEST_FAIL(msg);
+        goto cleanup;
+    }
+
+    TEST_PASS();
+
+cleanup:
+    vaDestroyImage(dpy, image.image_id);
+    vaDestroyBuffer(dpy, coded);
+    vaDestroyContext(dpy, context);
+    vaDestroySurfaces(dpy, &surface, 1);
+    vaDestroyConfig(dpy, config);
+}
+
+/* --- Test: framerate change mid-session doesn't break encode --- */
+
+/* Chrome also pushes VAEncMiscParameterTypeFrameRate when its capture rate
+ * changes (e.g. tab visibility, throttled camera). Even if the perceptual
+ * effect is subtle, we should hand the new framerate to NVENC so its rate-
+ * control math is against the right frame budget. A regression that made
+ * this call error out would surface as vaEndPicture failing, which this
+ * test catches deterministically. */
+static void test_framerate_reconfigure_mid_session(void)
+{
+    TEST_START("Framerate change mid-session doesn't break encode");
+
+    VAConfigAttrib attribs[2] = {
+        { .type = VAConfigAttribRTFormat,   .value = VA_RT_FORMAT_YUV420 },
+        { .type = VAConfigAttribRateControl, .value = VA_RC_CBR },
+    };
+    VAConfigID config;
+    VAStatus st = vaCreateConfig(dpy, VAProfileH264High, VAEntrypointEncSlice,
+                                  attribs, 2, &config);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "config");
+
+    const uint32_t W = 640, H = 480;
+    VASurfaceID surface;
+    vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, W, H, &surface, 1, NULL, 0);
+    VAContextID context;
+    vaCreateContext(dpy, config, W, H, VA_PROGRESSIVE, &surface, 1, &context);
+    VABufferID coded;
+    vaCreateBuffer(dpy, context, VAEncCodedBufferType, W * H, 1, NULL, &coded);
+
+    VAImageFormat fmt = { .fourcc = VA_FOURCC_NV12 };
+    VAImage image;
+    vaCreateImage(dpy, &fmt, W, H, &image);
+
+    const uint32_t rates[] = { 30, 15, 24, 60, 12 };
+    const int perStage = 10;
+    int frameCounter = 0;
+
+    for (size_t r = 0; r < sizeof(rates)/sizeof(rates[0]); r++) {
+        const uint32_t fps = rates[r];
+        for (int frame = 0; frame < perStage; frame++) {
+            fill_nv12_image_variable(&image, frameCounter);
+            vaPutImage(dpy, surface, image.image_id, 0, 0, W, H, 0, 0, W, H);
+            frameCounter++;
+
+            const bool isFirstFrameEver = (r == 0 && frame == 0);
+            VAEncSequenceParameterBufferH264 seq = {
+                .picture_width_in_mbs = W / 16, .picture_height_in_mbs = H / 16,
+                .intra_period = 0, .ip_period = 1,
+            };
+            VAEncPictureParameterBufferH264 pic = {
+                .coded_buf = coded,
+                .pic_fields.bits.idr_pic_flag = isFirstFrameEver ? 1 : 0,
+            };
+            VAEncSliceParameterBufferH264 slice = {
+                .slice_type = isFirstFrameEver ? 2 : 0,
+            };
+
+            VABufferID bufs[5];
+            vaCreateBuffer(dpy, context, VAEncSequenceParameterBufferType,
+                            sizeof(seq), 1, &seq, &bufs[0]);
+            vaCreateBuffer(dpy, context, VAEncPictureParameterBufferType,
+                            sizeof(pic), 1, &pic, &bufs[1]);
+            vaCreateBuffer(dpy, context, VAEncSliceParameterBufferType,
+                            sizeof(slice), 1, &slice, &bufs[2]);
+
+            size_t rcSize = sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl);
+            vaCreateBuffer(dpy, context, VAEncMiscParameterBufferType,
+                            rcSize, 1, NULL, &bufs[3]);
+            VAEncMiscParameterBuffer *rcMisc;
+            vaMapBuffer(dpy, bufs[3], (void **)&rcMisc);
+            rcMisc->type = VAEncMiscParameterTypeRateControl;
+            VAEncMiscParameterRateControl *rc = (VAEncMiscParameterRateControl*) rcMisc->data;
+            rc->bits_per_second = 1500000;
+            rc->target_percentage = 100;
+            vaUnmapBuffer(dpy, bufs[3]);
+
+            size_t frSize = sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterFrameRate);
+            vaCreateBuffer(dpy, context, VAEncMiscParameterBufferType,
+                            frSize, 1, NULL, &bufs[4]);
+            VAEncMiscParameterBuffer *frMisc;
+            vaMapBuffer(dpy, bufs[4], (void **)&frMisc);
+            frMisc->type = VAEncMiscParameterTypeFrameRate;
+            VAEncMiscParameterFrameRate *fr = (VAEncMiscParameterFrameRate*) frMisc->data;
+            fr->framerate = fps; /* den=1 encoded implicitly */
+            vaUnmapBuffer(dpy, bufs[4]);
+
+            vaBeginPicture(dpy, context, surface);
+            vaRenderPicture(dpy, context, bufs, 5);
+            VAStatus est = vaEndPicture(dpy, context);
+            if (est != VA_STATUS_SUCCESS) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "vaEndPicture failed at fps=%u", fps);
+                TEST_FAIL(msg);
+                for (int i = 0; i < 5; i++) vaDestroyBuffer(dpy, bufs[i]);
+                goto cleanup;
+            }
+
+            VACodedBufferSegment *seg;
+            vaMapBuffer(dpy, coded, (void **)&seg);
+            bool empty = (!seg || !seg->buf || seg->size == 0);
+            vaUnmapBuffer(dpy, coded);
+            if (empty) {
+                TEST_FAIL("empty coded buffer after framerate change");
+                for (int i = 0; i < 5; i++) vaDestroyBuffer(dpy, bufs[i]);
+                goto cleanup;
+            }
+
+            for (int i = 0; i < 5; i++) vaDestroyBuffer(dpy, bufs[i]);
+        }
+    }
+
+    TEST_PASS();
+
+cleanup:
+    vaDestroyImage(dpy, image.image_id);
+    vaDestroyBuffer(dpy, coded);
+    vaDestroyContext(dpy, context);
+    vaDestroySurfaces(dpy, &surface, 1);
+    vaDestroyConfig(dpy, config);
+}
+
 /* --- Test: automatic descriptor mode (NVD_DESCRIPTOR_MODE unset/auto) --- */
 
 /* With NVD_DESCRIPTOR_MODE left unset (the default AUTO mode), surfaces that
@@ -1432,6 +1892,11 @@ int main(int argc, char **argv)
     test_sequential_encodes();
     test_coded_buffer_reuse();
     test_long_running_single_session();
+
+    printf("\nDynamic reconfigure (BWE / camera rate changes):\n");
+    test_bitrate_reconfigure_mid_session();
+    test_bitrate_reconfigure_ramp_down_and_up();
+    test_framerate_reconfigure_mid_session();
 
     printf("\nDescriptor mode (auto):\n");
     test_encode_surface_export_auto_combined();
