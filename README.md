@@ -506,6 +506,19 @@ efortin PR #427 base and elFarto's upstream master. See
   `tests/test_encode_config.c` +  `tests/test_ipc_fuzz.c` cover the surface
   above, including the reconfigure fix (see the three
   `test_*_reconfigure_*` cases).
+- **Statistics subsystem picked back up from upstream** — during the
+  earlier upstream merge (`51654ee`), upstream's own split of the
+  `NVD_STATS` subsystem into `src/stats.{c,h}` (elFarto commit
+  `609c6ce`, cherry `eb102da`) was silently dropped by an `--ours`
+  resolution, leaving the inline stats copy in `vabackend.c`. Cherry-
+  picked upstream's split back in: `NVStatCounter` enum, `nvStatsInit`,
+  `nvStatsIncrement`, `nvStatsLog` now live in `src/stats.c`; the tiny
+  `nv_gettid` / `nvStatsOutput` helpers stay in `vabackend.c` as
+  non-static and are re-exported through `vabackend.h`. Kept the
+  fork's `NVD_DESCRIPTOR_MODE` parsing block right next to the new
+  `nvStatsInit(drv)` call. Same rationale as the encode-dispatch split
+  above: reduce the delta this fork carries in `vabackend.c` so
+  upstream merges stop churning it.
 - **Encode-dispatch split into `src/nvenc_dispatch.c`** — the four
   encode-side entry points that used to live inline in
   `src/vabackend.c` (`nvGetConfigAttributesEncode`,
