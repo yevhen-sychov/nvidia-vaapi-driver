@@ -384,7 +384,7 @@ Individual harnesses:
 | `test_encode` | Encode entrypoints, config attributes, single-frame encode for H.264 / HEVC / HEVC Main10 / AV1 / AV1 Main10, rate control + quality-level params, AV1 temporal SVC and combined-RTFormat encode, dynamic resolution, sequential encodes, coded-buffer reuse, long-running single session, live bitrate/framerate reconfigure, auto-combined encode export, decode-still-works co-existence, dimension-mismatch, H.264 B-frames. |
 | `test_encode_config` | Config-side coverage: entrypoints, RTFormat, rate control, packed headers, ref frames, max dimensions, quality range, surface allocation (NV12 / P010 / small / 4K), export descriptor. |
 | `test_ipc_fuzz` | Fuzz surface for the NVENC out-of-process IPC helper (invalid commands, truncated inits, oversized payloads, rapid connect/disconnect, double-init, encode-without-init). |
-| `tests/test_ffmpeg.sh` | End-to-end ffmpeg + VA-API smoke test. Defaults to `samples/input.mp4`; override with a positional path argument. |
+| `tests/test_ffmpeg.sh` | End-to-end ffmpeg + VA-API smoke test. Defaults to `samples/smptebars_h264.mp4` (produced by `samples/gensamples.sh`); override with a positional path argument. |
 | `tests/test_gstreamer.sh` | End-to-end GStreamer VA-API smoke test. |
 
 Every code change to this fork lands with a test — see [Development workflow](#development-workflow) below.
@@ -392,9 +392,20 @@ Every code change to this fork lands with a test — see [Development workflow](
 ## Sample media
 
 Test media lives under `samples/` and is **not tracked in git** (see
-`.gitignore`). If you want to run the ffmpeg smoke test locally, drop an
-`input.mp4` (or any container/codec supported by your ffmpeg build) into
-`samples/`; the meson test wiring points at `samples/input.mp4` by default.
+`.gitignore` — `samples/*.mp4`). Generate the synthetic fixtures used by the
+ffmpeg smoke test with:
+
+```sh
+./samples/gensamples.sh
+```
+
+The script writes SMPTE-bars test clips (H.264, HEVC 8/10/12-bit, HEVC 4:2:2
+8/10/12-bit, MPEG-4, VP9, AV1) into the `samples/` directory regardless of
+the current working directory. `tests/test_ffmpeg.sh` and the meson `ffmpeg`
+test default to `samples/smptebars_h264.mp4` — the first file produced by
+`gensamples.sh` — so a partial run of the generator is enough to exercise
+the smoke test. Any other container/codec supported by your ffmpeg build
+works too; pass it as a positional argument to `test_ffmpeg.sh`.
 
 # Development workflow
 
@@ -495,5 +506,11 @@ efortin PR #427 base and elFarto's upstream master. See
   `tests/test_encode_config.c` +  `tests/test_ipc_fuzz.c` cover the surface
   above, including the reconfigure fix (see the three
   `test_*_reconfigure_*` cases).
-- **Samples relocation** — the ffmpeg smoke-test input moved from
-  `tests/input.mp4` to `samples/input.mp4` and is now untracked.
+- **Samples relocation + generator hardening** — the ffmpeg smoke-test
+  input moved from `tests/input.mp4` to `samples/` (untracked). The
+  `samples/gensamples.sh` fixture generator now writes into its own
+  directory instead of `$PWD` (previously polluted the repo root when
+  invoked as `./samples/gensamples.sh`), passes `-y` so re-runs don't
+  hang on overwrite prompts, and the default input for `test_ffmpeg.sh`
+  is now `samples/smptebars_h264.mp4` — the first fixture the generator
+  produces.

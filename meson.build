@@ -146,7 +146,7 @@ if not meson.is_cross_build()
     ffmpeg = find_program('ffmpeg', required : false)
     if ffmpeg.found()
         test('ffmpeg', find_program('tests/test_ffmpeg.sh'),
-             args: [meson.current_source_dir() + '/samples/input.mp4'],
+             args: [meson.current_source_dir() + '/samples/smptebars_h264.mp4'],
              timeout : 120,
              env : test_env)
     endif

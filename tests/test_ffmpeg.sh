@@ -3,11 +3,14 @@ set -u
 
 export LIBVA_DRIVER_NAME=nvidia
 
-# INPUT_FILE can be passed as argument, default to samples/input.mp4
-INPUT_FILE=${1:-samples/input.mp4}
+# INPUT_FILE can be passed as argument. Default is the H.264 smpte-bars
+# fixture produced by samples/gensamples.sh -- the first (and cheapest)
+# thing that script emits, so a partial gensamples run is enough.
+INPUT_FILE=${1:-samples/smptebars_h264.mp4}
 
 if [ ! -f "$INPUT_FILE" ]; then
     echo "Input file $INPUT_FILE not found"
+    echo "Generate the default fixture with: ./samples/gensamples.sh"
     exit 1
 fi
 
