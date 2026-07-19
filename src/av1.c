@@ -178,7 +178,7 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
     pps->enable_masked_compound = buf->seq_info_fields.fields.enable_masked_compound;
     pps->enable_dual_filter = buf->seq_info_fields.fields.enable_dual_filter;
     pps->enable_order_hint = buf->seq_info_fields.fields.enable_order_hint;
-    pps->order_hint_bits_minus1 = buf->order_hint_bits_minus_1;
+    pps->order_hint_bits_minus1 = pps->enable_order_hint ? buf->order_hint_bits_minus_1 : 0;
     pps->enable_jnt_comp = buf->seq_info_fields.fields.enable_jnt_comp;
     //TODO not quite correct, use_superres can be 0, and enable_superres can be 1
     pps->enable_superres = buf->pic_info_fields.bits.use_superres;
@@ -196,7 +196,7 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
     pps->disable_cdf_update = buf->pic_info_fields.bits.disable_cdf_update;
     pps->allow_screen_content_tools = buf->pic_info_fields.bits.allow_screen_content_tools;
     pps->force_integer_mv = buf->pic_info_fields.bits.force_integer_mv || picParams->intra_pic_flag;
-    pps->coded_denom = buf->superres_scale_denominator;
+    pps->coded_denom = buf->pic_info_fields.bits.use_superres ? buf->superres_scale_denominator - 9 : 0;
     pps->allow_intrabc = buf->pic_info_fields.bits.allow_intrabc;
     pps->allow_high_precision_mv = buf->pic_info_fields.bits.allow_high_precision_mv;
 
@@ -351,12 +351,14 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
 
     if (pps->apply_grain) {
         NVSurface *display = nvSurfaceFromSurfaceId(ctx->drv, buf->current_display_picture);
-        if (display != NULL) {
+        if (display != NULL && display != ctx->renderTarget && display->pictureIdx >= 0) {
             ctx->displayTarget = display;
             picParams->CurrPicIdx = display->pictureIdx;
             pps->decodePicIdx = ctx->renderTarget->pictureIdx;
-        } else {
+        } else if (display == NULL) {
             LOG("AV1 film grain requested without a valid display surface: %u", buf->current_display_picture);
+        } else if (display->pictureIdx < 0) {
+            LOG("AV1 film grain display surface %u has no picture index yet, decoding in place", buf->current_display_picture);
         }
     }
 
@@ -472,16 +474,29 @@ static void ensureAV1SliceOffsetStorage(NVContext *ctx, const uint32_t numSlices
     }
 
     if (ctx->sliceOffsets.buf == NULL) {
-        ctx->sliceOffsets.allocated = requiredSize * 2;
-        ctx->sliceOffsets.buf = memalign(16, ctx->sliceOffsets.allocated);
-    } else if (requiredSize > ctx->sliceOffsets.allocated) {
-        while (requiredSize > ctx->sliceOffsets.allocated) {
-            ctx->sliceOffsets.allocated += ctx->sliceOffsets.allocated >> 1;
+        void *newBuffer = memalign(16, requiredSize * 2);
+        if (newBuffer == NULL) {
+            LOG("Unable to allocate AV1 slice offset storage");
+            ctx->sliceOffsets.size = 0;
+            return;
         }
-        void *newBuffer = memalign(16, ctx->sliceOffsets.allocated);
+        ctx->sliceOffsets.allocated = requiredSize * 2;
+        ctx->sliceOffsets.buf = newBuffer;
+    } else if (requiredSize > ctx->sliceOffsets.allocated) {
+        uint64_t newAllocated = ctx->sliceOffsets.allocated;
+        while (requiredSize > newAllocated) {
+            newAllocated += newAllocated >> 1;
+        }
+        void *newBuffer = memalign(16, newAllocated);
+        if (newBuffer == NULL) {
+            LOG("Unable to grow AV1 slice offset storage");
+            ctx->sliceOffsets.size = 0;
+            return;
+        }
         memcpy(newBuffer, ctx->sliceOffsets.buf, oldSize);
         free(ctx->sliceOffsets.buf);
         ctx->sliceOffsets.buf = newBuffer;
+        ctx->sliceOffsets.allocated = newAllocated;
     }
 
     if (requiredSize > oldSize) {
@@ -507,6 +522,10 @@ static void setAV1SliceOffsets(NVContext *ctx, CUVIDPICPARAMS *picParams, const 
     }
 
     ensureAV1SliceOffsetStorage(ctx, numSlices);
+    if (ctx->sliceOffsets.buf == NULL) {
+        LOG("AV1 slice offset storage unavailable, skipping %u tile offsets", count);
+        return;
+    }
     for (unsigned int i = 0; i < count; i++) {
         uint32_t tileIndex = getAV1SliceTileIndex(pps, &sliceParams[i], i);
         if (tileIndex >= numSlices) {

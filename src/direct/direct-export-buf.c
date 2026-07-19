@@ -417,7 +417,8 @@ static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface
     const NVFormatInfo *fmtInfo = &formatsInfo[backingImage->format];
 
     backingImage->totalSize = calculate_unified_image_layout(&drv->driverContext, driverImages, surface->width, surface->height,
-                                                             fmtInfo->bppc, fmtInfo->numPlanes, fmtInfo->plane);
+                                                             fmtInfo->bppc, fmtInfo->numPlanes, fmtInfo->plane,
+                                                             true);
     LOG("Allocating single BackingImage: %p %ux%u (format %d) = %u bytes", backingImage, surface->width, surface->height, backingImage->format, backingImage->totalSize);
 
     int memFd = -1;
