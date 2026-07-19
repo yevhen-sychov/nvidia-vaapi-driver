@@ -2,6 +2,16 @@
 
 This is an VA-API implementation that uses NVDEC as a decode backend and NVENC as an encode backend. The decode path is specifically designed to be used by Firefox for accelerated decode of web content, and may not operate correctly in other applications. This fork additionally implements hardware **video encoding** (H.264, HEVC and AV1) through NVENC.
 
+The NVENC encode work in this fork is directly built on top of
+[@efortin](https://github.com/efortin)'s upstream PR
+[elFarto/nvidia-vaapi-driver#427 — *feat(core): Add NVENC Encoding Support via VA-API*](https://github.com/elFarto/nvidia-vaapi-driver/pull/427).
+That PR contributes the entire foundation — the `VAEntrypointEncSlice` wiring,
+the 32-bit → 64-bit shared-memory bridge / `nvenc-helper` daemon, `vaDeriveImage`,
+the encode/encode-config/IPC-fuzz test harnesses, and the H.264 + HEVC encoders
+including the Steam Remote Play integration path. Everything below labelled as
+"this fork" is a downstream on top of that work. See
+[Credits](#credits--upstream) for the full attribution.
+
 # Table of contents
 
 - [nvidia-vaapi-driver](#nvidia-vaapi-driver)
@@ -24,6 +34,11 @@ This is an VA-API implementation that uses NVDEC as a decode backend and NVENC a
   - [NVENC encode helper](#nvenc-encode-helper)
   - [Direct Backend](#direct-backend)
 - [Testing](#testing)
+  - [Test suite](#test-suite)
+  - [Sample media](#sample-media)
+- [Development workflow](#development-workflow)
+- [Credits & upstream](#credits--upstream)
+- [Fork changelog](#fork-changelog)
 
 # Codec Support
 
@@ -63,6 +78,30 @@ Hardware encoding is exposed through the VA-API `VAEntrypointEncSlice` entrypoin
 |VP8 / VP9|:x:||Not supported by NVENC.|
 
 Actual encode capabilities depend on your GPU's NVENC generation. To view which codecs your card is capable of encoding you can use the `vainfo` command with this driver installed, or visit the NVIDIA [encode/decode support matrix](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new#geforce).
+
+### Live rate-control / framerate updates (WebRTC BWE)
+
+Mid-session `VAEncMiscParameterTypeRateControl` and `VAEncMiscParameterTypeFrameRate`
+buffers — which is how Chrome's WebRTC bandwidth estimator (BWE) throttles the
+encoder up and down as network conditions change, and how camera-rate switches
+are propagated — are applied to the running NVENC session via
+`nvEncReconfigureEncoder`. Without this the encoder silently kept emitting at
+its initial bitrate and framerate, saturated the uplink on BWE reductions and
+caused frozen frames on the peer. Test coverage lives in
+`tests/test_encode.c` (`test_bitrate_reconfigure_mid_session`,
+`test_bitrate_reconfigure_ramp_down_and_up`,
+`test_framerate_reconfigure_mid_session`).
+
+### Long-running session stability
+
+The per-frame CUDA staging buffer and NVENC-registered input resource are now
+persistent across frames for the lifetime of the encode session — allocated on
+the first frame at the session's dimensions and reused, re-registered only when
+input dimensions actually change. Repeatedly allocating device memory and
+registering/unregistering NVENC resources every frame was found to gradually
+destabilize long-running encode sessions (hard crash after a few minutes on
+sustained WebRTC calls). Regression is guarded by
+`test_long_running_single_session` in `tests/test_encode.c`.
 
 # Installation
 
@@ -324,3 +363,137 @@ To verify that the driver is being used to decode video, you can use nvidia-sett
 - nvidia-smi
 
   Running `nvidia-smi` while decoding a video should show a Firefox process with `C` in the `Type` column. In addition `nvidia-smi pmon` will show the usage of the decode engine per-process, and `nvidia-smi dmon` will show the usage per-GPU. When using nvidia open gpu kernel modules, the usage of the decode engine may not be displayed correctly.
+
+## Test suite
+
+An in-tree test suite exercises both the decode and encode paths against a real
+NVIDIA GPU and the installed VA-API loader. It requires the driver to be built
+against a working CUDA/NVENC stack and, for the ffmpeg smoke test, a working
+`ffmpeg` binary on `PATH`.
+
+```sh
+meson setup build
+meson test -C build
+```
+
+Individual harnesses:
+
+| Binary / script | What it covers |
+|---|---|
+| `test_decode` | AV1 (8-bit + 10-bit) decode init, combined-RTFormat resolution, DMA-BUF export, auto descriptor mode / self-preview heuristic. |
+| `test_encode` | Encode entrypoints, config attributes, single-frame encode for H.264 / HEVC / HEVC Main10 / AV1 / AV1 Main10, rate control + quality-level params, AV1 temporal SVC and combined-RTFormat encode, dynamic resolution, sequential encodes, coded-buffer reuse, long-running single session, live bitrate/framerate reconfigure, auto-combined encode export, decode-still-works co-existence, dimension-mismatch, H.264 B-frames. |
+| `test_encode_config` | Config-side coverage: entrypoints, RTFormat, rate control, packed headers, ref frames, max dimensions, quality range, surface allocation (NV12 / P010 / small / 4K), export descriptor. |
+| `test_ipc_fuzz` | Fuzz surface for the NVENC out-of-process IPC helper (invalid commands, truncated inits, oversized payloads, rapid connect/disconnect, double-init, encode-without-init). |
+| `tests/test_ffmpeg.sh` | End-to-end ffmpeg + VA-API smoke test. Defaults to `samples/input.mp4`; override with a positional path argument. |
+| `tests/test_gstreamer.sh` | End-to-end GStreamer VA-API smoke test. |
+
+Every code change to this fork lands with a test — see [Development workflow](#development-workflow) below.
+
+## Sample media
+
+Test media lives under `samples/` and is **not tracked in git** (see
+`.gitignore`). If you want to run the ffmpeg smoke test locally, drop an
+`input.mp4` (or any container/codec supported by your ffmpeg build) into
+`samples/`; the meson test wiring points at `samples/input.mp4` by default.
+
+# Development workflow
+
+This fork carries a substantial delta from upstream (see
+[Fork changelog](#fork-changelog)). Two rules keep that delta maintainable:
+
+1. **Tests come with every code change.** New code paths get new coverage in
+   `tests/`, changed code paths get their existing test re-exercised. Prefer
+   extending an existing `test_*` function to adding a whole new one when the
+   change fits. Truly untestable changes (e.g. purely defensive tightening in a
+   path we cannot drive from the harness) must be called out explicitly rather
+   than merged bare.
+2. **README tracks user-visible surface.** Anything a downstream user might
+   configure, set as an env var, see in `NVD_LOG=1`, or trip over at runtime
+   goes into this file in the same task as the code change. Internal refactors
+   don't need README updates; behavior changes always do.
+
+The [Fork changelog](#fork-changelog) below is the running record of what this
+fork has added on top of upstream — update it when you land a notable change.
+
+# Credits & upstream
+
+This fork stands on two upstream shoulders and should be read as a downstream
+patch series on top of them:
+
+- **[elFarto/nvidia-vaapi-driver](https://github.com/elFarto/nvidia-vaapi-driver)**
+  — the original VA-API implementation over NVDEC (decode). Everything under
+  the decode entrypoints, the EGL + direct backends, the DMA-BUF export
+  plumbing, and the Firefox integration story comes from there.
+
+- **[@efortin](https://github.com/efortin)**, via upstream PR
+  [elFarto/nvidia-vaapi-driver#427](https://github.com/elFarto/nvidia-vaapi-driver/pull/427)
+  — ***feat(core): Add NVENC Encoding Support via VA-API***. This is where
+  hardware encoding in this driver comes from. The PR (49 commits, +5,362
+  −64 across 21 files, opened April 2026, branch `efortin:feat/nvenc-support`
+  — the very branch name this fork carries) contributes:
+    - `VAEntrypointEncSlice` end-to-end for H.264 (Constrained Baseline /
+      Main / High) and HEVC (Main + Main10).
+    - The 32-bit → 64-bit shared-memory bridge, `nvenc-helper` daemon,
+      `nvenc-helper.service` systemd unit, and the Unix-socket + memfd IPC
+      protocol — the mechanism that unlocks Steam Remote Play on Blackwell
+      (RTX 50xx) where NVIDIA dropped 32-bit CUDA support.
+    - `vaDeriveImage` for zero-copy capture, DRM-backed surface allocation
+      without CUDA, NV12 pitch/height alignment for MB-aligned encoders,
+      periodic IDR + client-triggered IDR forwarding, dead-client detection
+      via `poll()` timeout, NVIDIA opaque-fd vs DMA-BUF-fd handling.
+    - The initial test-suite scaffolding — `test_encode`, `test_encode_config`,
+      `test_ipc_fuzz`, `test_gstreamer` — including the IPC fuzz-safety cases,
+      ASAN/UBSAN sweep, and 71-test acceptance gate.
+    - Steam Remote Play validation (Mac Steam Link, Legion Go) that
+      demonstrates the encode path is real-world usable end-to-end.
+
+  If you file issues about NVENC encode behavior that trace back to those
+  foundations, credit belongs upstream on PR #427; if it traces back to the
+  additions listed under [Fork changelog](#fork-changelog), that's on this
+  fork.
+
+- **Everyone else** whose PRs against elFarto/nvidia-vaapi-driver we merge in
+  from upstream master. See `git log --author=... --oneline` for individual
+  attribution.
+
+# Fork changelog
+
+Highlights of what `feat/nvenc-support` in *this* fork adds on top of the
+efortin PR #427 base and elFarto's upstream master. See
+`git log --oneline main..HEAD` for the exhaustive list.
+
+- **NVENC encode entrypoint** — full VA-API `VAEntrypointEncSlice` for H.264
+  (Constrained Baseline / Main / High), HEVC (Main, Main10) and AV1 (Profile0).
+  Exposed via `VAConfigAttribRateControl`, packed headers, quality level, ref
+  frames, max dimensions, and (AV1) temporal SVC.
+- **NVENC out-of-process helper** — `nvenc-helper.service` (user systemd unit)
+  + `/usr/libexec/nvenc-helper` binary + IPC channel for sandboxed browser
+  processes that can't init CUDA/NVENC directly. Rebuild + restart with
+  `update-nvenc.sh`.
+- **Chrome-compatible DMA-BUF descriptor mode** — `NVD_DESCRIPTOR_MODE` env
+  var (default `auto`), picks per-surface layout for encode-context vs.
+  decode-context surfaces, with a resolution-matching heuristic that also
+  routes a decode surface through the combined-fourcc path when it's a
+  self-preview of a currently active local encode.
+- **Live rate-control / framerate reconfigure** — mid-session
+  `VAEncMiscParameterTypeRateControl` /
+  `VAEncMiscParameterTypeFrameRate` are applied through
+  `nvEncReconfigureEncoder`, so WebRTC BWE actually throttles the hardware
+  encoder up and down instead of being silently ignored.
+- **Long-running session stability** — persistent linear staging buffer +
+  NVENC-registered input resource per encode session (no per-frame alloc /
+  registration churn), fixing hard crashes ~a few minutes into sustained
+  WebRTC calls.
+- **Resource-release + detach-race + decoder-init hardening** — ported from
+  upstream master onto the fork's paths: `direct-export-buf.c` cleanup on the
+  bail path uses the real `destroyBackingImage` helper and takes the images
+  mutex around detach; `vabackend.c` guards resolve-thread teardown with a
+  `resolveThreadStarted` flag to avoid a UAF window; `CUVIDDECODECREATEINFO`
+  is no longer initialized with a self-referential expression (previously
+  undefined behavior surfaced as spurious CUDA OOM).
+- **Encoder test suite** — `tests/test_encode.c` +
+  `tests/test_encode_config.c` +  `tests/test_ipc_fuzz.c` cover the surface
+  above, including the reconfigure fix (see the three
+  `test_*_reconfigure_*` cases).
+- **Samples relocation** — the ffmpeg smoke-test input moved from
+  `tests/input.mp4` to `samples/input.mp4` and is now untracked.
