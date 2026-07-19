@@ -257,11 +257,74 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
     }
 
     nvencCtx->initialized = true;
+    nvencCtx->appliedBitrate = nvencCtx->encodeConfig.rcParams.averageBitRate;
+    nvencCtx->appliedMaxBitrate = nvencCtx->encodeConfig.rcParams.maxBitRate;
+    nvencCtx->appliedFrameRateNum = nvencCtx->initParams.frameRateNum;
+    nvencCtx->appliedFrameRateDen = nvencCtx->initParams.frameRateDen;
     LOG("NVENC encoder initialized: %ux%u codec=%s",
         width, height,
         memcmp(&codecGuid, &NV_ENC_CODEC_H264_GUID, sizeof(GUID)) == 0 ? "H.264" :
         (memcmp(&codecGuid, &NV_ENC_CODEC_HEVC_GUID, sizeof(GUID)) == 0 ? "HEVC" : "AV1"));
 
+    return true;
+}
+
+bool nvenc_reconfigure_if_needed(NVENCContext *nvencCtx)
+{
+    if (!nvencCtx->initialized || nvencCtx->encoder == NULL) {
+        return true;
+    }
+
+    const uint32_t reqBitrate = nvencCtx->bitrate;
+    const uint32_t reqMaxBitrate = nvencCtx->maxBitrate > 0 ? nvencCtx->maxBitrate : reqBitrate;
+    const uint32_t reqFrameRateNum = nvencCtx->frameRateNum > 0 ? nvencCtx->frameRateNum : nvencCtx->appliedFrameRateNum;
+    const uint32_t reqFrameRateDen = nvencCtx->frameRateDen > 0 ? nvencCtx->frameRateDen : nvencCtx->appliedFrameRateDen;
+
+    const bool bitrateChanged = reqBitrate > 0 && reqBitrate != nvencCtx->appliedBitrate;
+    const bool maxBitrateChanged = reqMaxBitrate > 0 && reqMaxBitrate != nvencCtx->appliedMaxBitrate;
+    const bool frameRateChanged =
+        reqFrameRateNum != nvencCtx->appliedFrameRateNum ||
+        reqFrameRateDen != nvencCtx->appliedFrameRateDen;
+
+    if (!bitrateChanged && !maxBitrateChanged && !frameRateChanged) {
+        return true;
+    }
+
+    if (bitrateChanged) {
+        nvencCtx->encodeConfig.rcParams.averageBitRate = reqBitrate;
+    }
+    if (maxBitrateChanged) {
+        nvencCtx->encodeConfig.rcParams.maxBitRate = reqMaxBitrate;
+    }
+    if (frameRateChanged) {
+        nvencCtx->initParams.frameRateNum = reqFrameRateNum;
+        nvencCtx->initParams.frameRateDen = reqFrameRateDen;
+    }
+
+    NV_ENC_RECONFIGURE_PARAMS reconf = {0};
+    reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+    reconf.reInitEncodeParams = nvencCtx->initParams;
+    reconf.reInitEncodeParams.encodeConfig = &nvencCtx->encodeConfig;
+    reconf.resetEncoder = 0;
+    reconf.forceIDR = 0;
+
+    NVENCSTATUS st = nvencCtx->funcs.nvEncReconfigureEncoder(nvencCtx->encoder, &reconf);
+    if (!CHECK_NVENC(st)) {
+        LOG("NVENC: reconfigure failed (bitrate=%u max=%u fps=%u/%u), keeping previous config",
+            reqBitrate, reqMaxBitrate, reqFrameRateNum, reqFrameRateDen);
+        return false;
+    }
+
+    LOG("NVENC: reconfigured bitrate=%u->%u max=%u->%u fps=%u/%u->%u/%u",
+        nvencCtx->appliedBitrate, reqBitrate,
+        nvencCtx->appliedMaxBitrate, reqMaxBitrate,
+        nvencCtx->appliedFrameRateNum, nvencCtx->appliedFrameRateDen,
+        reqFrameRateNum, reqFrameRateDen);
+
+    nvencCtx->appliedBitrate = reqBitrate;
+    nvencCtx->appliedMaxBitrate = reqMaxBitrate;
+    nvencCtx->appliedFrameRateNum = reqFrameRateNum;
+    nvencCtx->appliedFrameRateDen = reqFrameRateDen;
     return true;
 }
 

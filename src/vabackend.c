@@ -3671,6 +3671,13 @@ static VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx)
             CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
         }
+    } else {
+        /* Encoder already running: pick up any bitrate/framerate changes
+         * Chrome pushed via misc params since the last encoded frame. Without
+         * this the encoder stays at whatever bitrate was in effect at
+         * initialization and ignores WebRTC BWE reductions, so it emits far
+         * above the target bitrate and saturates the peer connection. */
+        nvenc_reconfigure_if_needed(nvencCtx);
     }
 
     /* Realise the surface so we have a backing image with CUDA memory */

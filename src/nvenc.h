@@ -69,6 +69,19 @@ typedef struct {
     uint32_t                        registeredWidth;
     uint32_t                        registeredHeight;
     uint32_t                        registeredPitch;
+    /*
+     * Last values actually programmed into NVENC via init/reconfigure. When
+     * Chrome sends new rate-control or framerate values through misc params,
+     * we call nvEncReconfigureEncoder only if these differ from the stored
+     * requests (bitrate / maxBitrate / frameRateNum / frameRateDen). Without
+     * this, WebRTC's BWE bitrate reductions are silently ignored, encoder
+     * keeps emitting at the initial (much higher) bitrate, saturating the
+     * uplink and causing the peer to see stalls / frozen frames.
+     */
+    uint32_t                        appliedBitrate;
+    uint32_t                        appliedMaxBitrate;
+    uint32_t                        appliedFrameRateNum;
+    uint32_t                        appliedFrameRateDen;
 } NVENCContext;
 
 // Wraps VACodedBufferSegment with NVENC bitstream storage
@@ -89,6 +102,15 @@ void nvenc_close_session(NVENCContext *nvencCtx);
 bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
                         GUID codecGuid, GUID profileGuid,
                         NV_ENC_TUNING_INFO tuningInfo);
+
+/*
+ * Apply any pending bitrate/framerate changes (as recorded in nvencCtx via
+ * the codec misc-param handlers) to the running NVENC session using
+ * nvEncReconfigureEncoder. No-op when nothing changed since the last
+ * successful init/reconfigure. Returns false on a real API error; a mismatch
+ * that can't be reconfigured is logged and treated as best-effort.
+ */
+bool nvenc_reconfigure_if_needed(NVENCContext *nvencCtx);
 
 bool nvenc_alloc_output_buffer(NVENCContext *nvencCtx);
 void nvenc_free_output_buffer(NVENCContext *nvencCtx);
