@@ -64,6 +64,7 @@ sources = [
     'src/mpeg2.c',
     'src/mpeg4.c',
     'src/nvenc.c',
+    'src/nvenc_dispatch.c',
     'src/nvenc-ipc-client.c',
     'src/vabackend.c',
     'src/vc1.c',

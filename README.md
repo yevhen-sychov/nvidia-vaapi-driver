@@ -506,6 +506,18 @@ efortin PR #427 base and elFarto's upstream master. See
   `tests/test_encode_config.c` +  `tests/test_ipc_fuzz.c` cover the surface
   above, including the reconfigure fix (see the three
   `test_*_reconfigure_*` cases).
+- **Encode-dispatch split into `src/nvenc_dispatch.c`** — the four
+  encode-side entry points that used to live inline in
+  `src/vabackend.c` (`nvGetConfigAttributesEncode`,
+  `nvRenderPictureEncode`, `nvEndPictureEncode`,
+  `nvEndPictureEncodeIPC`) now live in a dedicated translation unit
+  called through prototypes in `src/nvenc.h`. The shared object-id
+  lookup helper is exported as `nvGetObjectPtr` in `src/vabackend.h`.
+  This shrinks `vabackend.c`'s diff-versus-upstream by ~730 lines and
+  moves that surface into a file upstream never touches, so future
+  upstream merges only conflict on the ~15 remaining thin
+  `if (nvCtx->isEncode)` call-sites in `vabackend.c` — not on the
+  encode implementation itself.
 - **Samples relocation + generator hardening** — the ffmpeg smoke-test
   input moved from `tests/input.mp4` to `samples/` (untracked). The
   `samples/gensamples.sh` fixture generator now writes into its own

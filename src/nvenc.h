@@ -137,6 +137,18 @@ GUID nvenc_va_profile_to_codec_guid(VAProfile profile);
 GUID nvenc_va_profile_to_profile_guid(VAProfile profile);
 NV_ENC_BUFFER_FORMAT nvenc_surface_format(VAProfile profile, int bitDepth);
 
+/*
+ * Encode-side VA-API entry points that used to live inline in vabackend.c and
+ * are now split into src/nvenc_dispatch.c. vabackend.c calls these when the
+ * VA config attribute query targets an encode profile (nvGetConfigAttributesEncode)
+ * or the active context is an encode context (nvRenderPictureEncode / nvEndPictureEncode).
+ */
+void nvGetConfigAttributesEncode(VAProfile profile,
+                                 VAConfigAttrib *attrib_list,
+                                 int num_attribs);
+void nvRenderPictureEncode(NVContext *nvCtx, NVBuffer *buf);
+VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx);
+
 void h264enc_handle_sequence_params(NVENCContext *ctx, NVBuffer *buf);
 void h264enc_handle_picture_params(NVENCContext *ctx, NVBuffer *buf);
 void h264enc_handle_slice_params(NVENCContext *ctx, NVBuffer *buf);
