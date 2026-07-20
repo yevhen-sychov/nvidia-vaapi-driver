@@ -174,6 +174,20 @@ VAStatus nvenc_dispatch_create_context(NVDriver *drv, NVConfig *cfg,
  * responsible for wrapping this in the cuCtxPushCurrent/PopCurrent pair
  * (encode teardown may touch CUDA resources on the direct path). */
 void nvenc_dispatch_destroy_context(NVDriver *drv, NVContext *nvCtx);
+/* Called from nvBeginPicture when nvCtx->isEncode: records the render
+ * target and resets per-frame encode state (pic type, forceIDR). */
+VAStatus nvenc_dispatch_begin_picture(NVContext *nvCtx, NVSurface *surface);
+/* Called from nvDeriveImage in IPC-encode-only mode (!drv->cudaAvailable):
+ * allocates a host-memory NV12/P010 backing for the surface and hands the
+ * caller a VAImage that points straight at it, so a client (Steam's
+ * ffmpeg) can write captured frames through vaMapBuffer with no GPU
+ * roundtrip. */
+VAStatus nvenc_dispatch_derive_image_hostmem(NVDriver *drv, NVSurface *surfaceObj,
+                                             VASurfaceID surface, VAImage *image);
+/* Called from nvPutImage in IPC-encode-only mode (!drv->cudaAvailable):
+ * copies the image buffer into the surface's host-memory pixel store,
+ * for later IPC transmission to the encode helper. */
+VAStatus nvenc_dispatch_put_image_hostmem(NVSurface *surfaceObj, NVImage *imageObj);
 
 void h264enc_handle_sequence_params(NVENCContext *ctx, NVBuffer *buf);
 void h264enc_handle_picture_params(NVENCContext *ctx, NVBuffer *buf);

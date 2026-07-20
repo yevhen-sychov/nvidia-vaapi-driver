@@ -531,11 +531,17 @@ efortin PR #427 base and elFarto's upstream master. See
   `nvenc_dispatch_destroy_context`. The shared object-id lookup and
   allocation helpers are exported as `nvGetObjectPtr` and
   `nvAllocateObject` in `src/vabackend.h`. This shrinks
-  `vabackend.c`'s diff-versus-upstream by ~900 lines and moves that
+  `vabackend.c`'s diff-versus-upstream by ~1000 lines and moves that
   surface into a file upstream never touches, so future upstream
   merges only conflict on the ~10 remaining thin
   `if (isEncode) return nvenc_dispatch_*(...)` call-sites in
-  `vabackend.c` — not on the encode implementation itself.
+  `vabackend.c` — not on the encode implementation itself. Also
+  covered: `nvenc_dispatch_begin_picture` (per-frame render-target
+  reset), and the two IPC-encode host-memory paths
+  (`nvenc_dispatch_derive_image_hostmem`,
+  `nvenc_dispatch_put_image_hostmem`) that back Steam's
+  `vaDeriveImage`/`vaMapBuffer` capture-write path when CUDA is
+  unavailable.
 - **Samples relocation + generator hardening** — the ffmpeg smoke-test
   input moved from `tests/input.mp4` to `samples/` (untracked). The
   `samples/gensamples.sh` fixture generator now writes into its own

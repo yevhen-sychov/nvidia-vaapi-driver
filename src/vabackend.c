@@ -3056,16 +3056,8 @@ static VAStatus nvBeginPicture(
         return VA_STATUS_SUCCESS;
     }
 
-    /* Encode path: just record the render target */
     if (nvCtx->isEncode) {
-        nvCtx->renderTarget = surface;
-        surface->context = nvCtx;
-        NVENCContext *nvencCtx = (NVENCContext*) nvCtx->encodeData;
-        if (nvencCtx) {
-            nvencCtx->picType = NV_ENC_PIC_TYPE_UNKNOWN;
-            nvencCtx->forceIDR = false;
-        }
-        return VA_STATUS_SUCCESS;
+        return nvenc_dispatch_begin_picture(nvCtx, surface);
     }
 
     if (surface->context != NULL && surface->context != nvCtx) {
@@ -3413,65 +3405,10 @@ static VAStatus nvDeriveImage(
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
 
-    /* In IPC encode-only mode, derive a host-memory image so Steam's ffmpeg
-     * can write captured NV12 frames into it via vaMapBuffer. The encoder
-     * then reads from this host memory via the IPC pixel-data path. */
+    /* IPC-encode-only mode (Steam's ffmpeg writes captured frames via
+     * vaMapBuffer into a host-memory image that the helper reads over IPC). */
     if (!drv->cudaAvailable) {
-        uint32_t width = surfaceObj->width;
-        uint32_t height = surfaceObj->height;
-        int bpp = (surfaceObj->bitDepth > 8) ? 2 : 1;
-        uint32_t lumaSize = width * bpp * height;
-        uint32_t chromaSize = width * bpp * (height / 2);
-        uint32_t totalSize = lumaSize + chromaSize;
-
-        /* Allocate or reuse the surface's host pixel buffer */
-        if (surfaceObj->hostPixelData == NULL || surfaceObj->hostPixelSize < totalSize) {
-            free(surfaceObj->hostPixelData);
-            surfaceObj->hostPixelData = malloc(totalSize);
-            if (surfaceObj->hostPixelData == NULL) {
-                surfaceObj->hostPixelSize = 0;
-                return VA_STATUS_ERROR_ALLOCATION_FAILED;
-            }
-            surfaceObj->hostPixelSize = totalSize;
-            memset(surfaceObj->hostPixelData, 0, totalSize);
-        }
-
-        /* Create a buffer object for the image data (points to the surface's host memory) */
-        Object imageBufferObj = nvAllocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
-        NVBuffer *imageBuf = (NVBuffer*) imageBufferObj->obj;
-        imageBuf->bufferType = VAImageBufferType;
-        imageBuf->size = totalSize;
-        imageBuf->elements = 1;
-        imageBuf->ptr = surfaceObj->hostPixelData; /* Shared with surface! */
-        imageBuf->offset = (size_t)-1; /* Sentinel: don't free ptr on destroy */
-
-        /* Create the image object */
-        Object imageObj = nvAllocateObject(drv, OBJECT_TYPE_IMAGE, sizeof(NVImage));
-        NVImage *img = (NVImage*) imageObj->obj;
-        img->width = width;
-        img->height = height;
-        img->format = (bpp == 1) ? NV_FORMAT_NV12 : NV_FORMAT_P010;
-        img->imageBuffer = imageBuf;
-
-        /* Fill VAImage output */
-        memset(image, 0, sizeof(*image));
-        image->image_id = imageObj->id;
-        image->format.fourcc = (bpp == 1) ? VA_FOURCC_NV12 : VA_FOURCC_P010;
-        image->format.byte_order = VA_LSB_FIRST;
-        image->format.bits_per_pixel = (bpp == 1) ? 12 : 24;
-        image->buf = imageBufferObj->id;
-        image->width = width;
-        image->height = height;
-        image->data_size = totalSize;
-        image->num_planes = 2;
-        image->pitches[0] = width * bpp;
-        image->pitches[1] = width * bpp;
-        image->offsets[0] = 0;
-        image->offsets[1] = lumaSize;
-
-        LOG("DeriveImage: surface %d → host image %d (%ux%u, %u bytes)",
-            surface, imageObj->id, width, height, totalSize);
-        return VA_STATUS_SUCCESS;
+        return nvenc_dispatch_derive_image_hostmem(drv, surfaceObj, surface, image);
     }
 
     /* Normal CUDA path: not supported */
@@ -3614,21 +3551,10 @@ static VAStatus nvPutImage(
 
     const NVFormatInfo *fmtInfo = &formatsInfo[imageObj->format];
 
-    /* Host-memory path: when CUDA is unavailable (IPC encode-only mode),
-     * store pixel data directly in the surface for later IPC transmission. */
+    /* IPC-encode-only mode (CUDA unavailable): stash pixel data in the
+     * surface's host store for later transmission over the IPC channel. */
     if (!drv->cudaAvailable) {
-        uint32_t totalSize = imageObj->imageBuffer->size;
-        if (surfaceObj->hostPixelData == NULL || surfaceObj->hostPixelSize < totalSize) {
-            free(surfaceObj->hostPixelData);
-            surfaceObj->hostPixelData = malloc(totalSize);
-            if (surfaceObj->hostPixelData == NULL) {
-                surfaceObj->hostPixelSize = 0;
-                return VA_STATUS_ERROR_ALLOCATION_FAILED;
-            }
-            surfaceObj->hostPixelSize = totalSize;
-        }
-        memcpy(surfaceObj->hostPixelData, imageObj->imageBuffer->ptr, totalSize);
-        return VA_STATUS_SUCCESS;
+        return nvenc_dispatch_put_image_hostmem(surfaceObj, imageObj);
     }
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
