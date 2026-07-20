@@ -148,6 +148,32 @@ void nvGetConfigAttributesEncode(VAProfile profile,
                                  int num_attribs);
 void nvRenderPictureEncode(NVContext *nvCtx, NVBuffer *buf);
 VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx);
+/* Called from nvCreateConfig when entrypoint == VAEntrypointEncSlice: rejects
+ * profiles NVENC does not handle, allocates a fresh NVConfig, and pre-fills
+ * it with the fork's encode-config defaults + rate-control + bit-depth from
+ * the client's attribute list. */
+VAStatus nvenc_dispatch_create_config(NVDriver *drv, VAProfile profile,
+                                      VAEntrypoint entrypoint,
+                                      VAConfigAttrib *attrib_list,
+                                      int num_attribs,
+                                      VAConfigID *config_id_out);
+/* Called from nvQueryConfigAttributes when cfg->isEncode: writes the
+ * VAConfigAttribRTFormat entry back out for the already-created config. */
+VAStatus nvenc_dispatch_query_config_attributes(NVConfig *cfg,
+                                                VAConfigAttrib *attrib_list,
+                                                int *num_attribs);
+/* Called from nvCreateContext when cfg->isEncode: allocates NVENCContext,
+ * opens the NVENC session (or falls back to the IPC path if CUDA is
+ * unavailable) and hands back a fresh VAContextID via *context_out. */
+VAStatus nvenc_dispatch_create_context(NVDriver *drv, NVConfig *cfg,
+                                       uint32_t picture_width,
+                                       uint32_t picture_height,
+                                       VAContextID *context_out);
+/* Called from destroyContext when nvCtx->isEncode: tears down the NVENC
+ * session or IPC channel and releases NVENCContext. The caller is
+ * responsible for wrapping this in the cuCtxPushCurrent/PopCurrent pair
+ * (encode teardown may touch CUDA resources on the direct path). */
+void nvenc_dispatch_destroy_context(NVDriver *drv, NVContext *nvCtx);
 
 void h264enc_handle_sequence_params(NVENCContext *ctx, NVBuffer *buf);
 void h264enc_handle_picture_params(NVENCContext *ctx, NVBuffer *buf);

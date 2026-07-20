@@ -519,18 +519,23 @@ efortin PR #427 base and elFarto's upstream master. See
   `nvStatsInit(drv)` call. Same rationale as the encode-dispatch split
   above: reduce the delta this fork carries in `vabackend.c` so
   upstream merges stop churning it.
-- **Encode-dispatch split into `src/nvenc_dispatch.c`** — the four
+- **Encode-dispatch split into `src/nvenc_dispatch.c`** — the
   encode-side entry points that used to live inline in
-  `src/vabackend.c` (`nvGetConfigAttributesEncode`,
-  `nvRenderPictureEncode`, `nvEndPictureEncode`,
-  `nvEndPictureEncodeIPC`) now live in a dedicated translation unit
-  called through prototypes in `src/nvenc.h`. The shared object-id
-  lookup helper is exported as `nvGetObjectPtr` in `src/vabackend.h`.
-  This shrinks `vabackend.c`'s diff-versus-upstream by ~730 lines and
-  moves that surface into a file upstream never touches, so future
-  upstream merges only conflict on the ~15 remaining thin
-  `if (nvCtx->isEncode)` call-sites in `vabackend.c` — not on the
-  encode implementation itself.
+  `src/vabackend.c` now live in a dedicated translation unit called
+  through prototypes in `src/nvenc.h`:
+  `nvGetConfigAttributesEncode`, `nvRenderPictureEncode`,
+  `nvEndPictureEncode`, `nvEndPictureEncodeIPC`,
+  `nvenc_dispatch_create_config`,
+  `nvenc_dispatch_query_config_attributes`,
+  `nvenc_dispatch_create_context`,
+  `nvenc_dispatch_destroy_context`. The shared object-id lookup and
+  allocation helpers are exported as `nvGetObjectPtr` and
+  `nvAllocateObject` in `src/vabackend.h`. This shrinks
+  `vabackend.c`'s diff-versus-upstream by ~900 lines and moves that
+  surface into a file upstream never touches, so future upstream
+  merges only conflict on the ~10 remaining thin
+  `if (isEncode) return nvenc_dispatch_*(...)` call-sites in
+  `vabackend.c` — not on the encode implementation itself.
 - **Samples relocation + generator hardening** — the ffmpeg smoke-test
   input moved from `tests/input.mp4` to `samples/` (untracked). The
   `samples/gensamples.sh` fixture generator now writes into its own

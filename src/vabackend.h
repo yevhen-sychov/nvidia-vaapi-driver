@@ -322,9 +322,10 @@ void appendBuffer(AppendableBuffer *ab, const void *buf, uint64_t size);
 int pictureIdxFromSurfaceId(NVDriver *ctx, VASurfaceID surf);
 NVSurface* nvSurfaceFromSurfaceId(NVDriver *drv, VASurfaceID surf);
 bool nvHasActiveEncodeContextWithResolution(NVDriver *drv, uint32_t width, uint32_t height);
-// Cross-TU lookup helper used by the moved encode dispatch code
+// Cross-TU lookup / allocation helpers used by the moved encode dispatch code
 // (src/nvenc_dispatch.c) as well as vabackend.c itself.
 void *nvGetObjectPtr(NVDriver *drv, ObjectType type, VAGenericID id);
+Object nvAllocateObject(NVDriver *drv, ObjectType type, size_t allocatePtrSize);
 const char *nvColorStandardName(VAProcColorStandardType colorStandard);
 VAProcColorStandardType nvColorStandardFromMatrixCoefficients(uint8_t matrixCoefficients);
 void nvSurfaceResetColorMetadata(NVSurface *surface);

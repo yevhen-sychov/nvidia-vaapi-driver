@@ -3,7 +3,6 @@
 #include "vabackend.h"
 #include "backend-common.h"
 #include "nvenc.h"
-#include "nvenc-ipc.h"
 #include "kernels.h"
 
 #include <assert.h>
@@ -394,7 +393,7 @@ static void freeBuffer(AppendableBuffer *ab) {
   }
 }
 
-static Object allocateObject(NVDriver *drv, ObjectType type, size_t allocatePtrSize) {
+Object nvAllocateObject(NVDriver *drv, ObjectType type, size_t allocatePtrSize) {
     Object newObj = (Object) calloc(1, sizeof(struct Object_t));
 
     newObj->type = type;
@@ -475,35 +474,7 @@ static bool destroyContext(NVDriver *drv, NVContext *nvCtx) {
     }
 
     if (nvCtx->isEncode) {
-        /* Encode context cleanup */
-        NVENCContext *nvencCtx = (NVENCContext*) nvCtx->encodeData;
-        if (nvencCtx != NULL) {
-            if (nvencCtx->useIPC) {
-                if (nvencCtx->shmPtr != NULL) {
-                    munmap(nvencCtx->shmPtr, nvencCtx->shmSize);
-                    nvencCtx->shmPtr = NULL;
-                }
-                if (nvencCtx->ipcFd >= 0) {
-                    nvenc_ipc_close(nvencCtx->ipcFd);
-                    nvencCtx->ipcFd = -1;
-                }
-            } else {
-                /* Release the persistent linear staging buffer/registration
-                 * before tearing down the encoder session. */
-                if (nvencCtx->registeredRes != NULL) {
-                    nvenc_unregister_resource(nvencCtx, nvencCtx->registeredRes);
-                    nvencCtx->registeredRes = NULL;
-                }
-                if (nvencCtx->linearBuffer != 0) {
-                    cu->cuMemFree(nvencCtx->linearBuffer);
-                    nvencCtx->linearBuffer = 0;
-                    nvencCtx->linearBufferSize = 0;
-                }
-                nvenc_close_session(nvencCtx);
-            }
-            free(nvencCtx);
-            nvCtx->encodeData = NULL;
-        }
+        nvenc_dispatch_destroy_context(drv, nvCtx);
         if (drv->cudaAvailable) {
             CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), false);
         }
@@ -991,69 +962,15 @@ static VAStatus nvCreateConfig(
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
 
     if (entrypoint == VAEntrypointEncSlice) {
-        /* Encode config */
-        if (!drv->nvencAvailable || !nvenc_is_encode_profile(profile)) {
-            LOG("Encode not supported for profile: %d", profile);
-            return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-        }
-
-        for (int i = 0; i < num_attribs; i++) {
-            LOG("Config attrib[%d]: type=%d, value=0x%x", i, attrib_list[i].type, attrib_list[i].value);
-        }
-
-        Object obj = allocateObject(drv, OBJECT_TYPE_CONFIG, sizeof(NVConfig));
-        NVConfig *cfg = (NVConfig*) obj->obj;
-        cfg->profile = profile;
-        cfg->entrypoint = entrypoint;
-        cfg->isEncode = true;
-        cfg->cudaCodec = vaToCuCodec(profile);
-        cfg->chromaFormat = cudaVideoChromaFormat_420;
-        cfg->bitDepth = 8;
-        cfg->surfaceFormat = cudaVideoSurfaceFormat_NV12;
-        cfg->rcMode = 0;
-        cfg->allowBframes = false;
-
-        /* Check for MaxRefFrames attribute to see if B-frames are allowed */
-        if (profile == VAProfileAV1Profile0) {
-            cfg->allowBframes = false;
-        }
-
-        if (profile == VAProfileHEVCMain10) {
-            cfg->bitDepth = 10;
-            cfg->surfaceFormat = cudaVideoSurfaceFormat_P016;
-        }
-
-        for (int i = 0; i < num_attribs; i++) {
-            if (attrib_list[i].type == VAConfigAttribRTFormat) {
-                /* Select 10-bit encode only when 10-bit is requested AND plain
-                 * 8-bit YUV420 is NOT also present. Clients that echo back the
-                 * capability mask we advertise for AV1 (VA_RT_FORMAT_YUV420 |
-                 * VA_RT_FORMAT_YUV420_10) mean "either", not "10-bit"; treating
-                 * that as 10-bit and then receiving 8-bit NV12 surfaces makes
-                 * the input copy fail and the whole encode aborts. */
-                if ((attrib_list[i].value & VA_RT_FORMAT_YUV420_10) &&
-                    !(attrib_list[i].value & VA_RT_FORMAT_YUV420)) {
-                    cfg->bitDepth = 10;
-                    cfg->surfaceFormat = cudaVideoSurfaceFormat_P016;
-                }
-            } else if (attrib_list[i].type == VAConfigAttribRateControl) {
-                cfg->rcMode = attrib_list[i].value;
-            } else if (attrib_list[i].type == VAConfigAttribEncMaxRefFrames) {
-                /* If client explicitly sets MaxRefFrames L1=0, disable B-frames */
-                if ((attrib_list[i].value & 0xffff0000) == 0) {
-                    cfg->allowBframes = false;
-                }
-            }
-        }
-        *config_id = obj->id;
-        return VA_STATUS_SUCCESS;
+        return nvenc_dispatch_create_config(drv, profile, entrypoint,
+                                            attrib_list, num_attribs, config_id);
     }
 
     //LOG("got profile: %d with %d attributes", profile, num_attribs);
     cudaVideoCodec cudaCodec = vaToCuCodec(profile);
 
     if (entrypoint == VAEntrypointVideoProc && profile == VAProfileNone) {
-        Object obj = allocateObject(drv, OBJECT_TYPE_CONFIG, sizeof(NVConfig));
+        Object obj = nvAllocateObject(drv, OBJECT_TYPE_CONFIG, sizeof(NVConfig));
         NVConfig *cfg = (NVConfig*) obj->obj;
         cfg->profile = profile;
         cfg->entrypoint = entrypoint;
@@ -1076,7 +993,7 @@ static VAStatus nvCreateConfig(
         return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
     }
 
-    Object obj = allocateObject(drv, OBJECT_TYPE_CONFIG, sizeof(NVConfig));
+    Object obj = nvAllocateObject(drv, OBJECT_TYPE_CONFIG, sizeof(NVConfig));
     NVConfig *cfg = (NVConfig*) obj->obj;
     cfg->profile = profile;
     cfg->entrypoint = entrypoint;
@@ -1252,17 +1169,8 @@ static VAStatus nvQueryConfigAttributes(
     *profile = cfg->profile;
     *entrypoint = cfg->entrypoint;
 
-    /* Encode config attributes */
     if (cfg->isEncode) {
-        int i = 0;
-        attrib_list[i].type = VAConfigAttribRTFormat;
-        attrib_list[i].value = VA_RT_FORMAT_YUV420;
-        if (cfg->profile == VAProfileHEVCMain10 || cfg->profile == VAProfileAV1Profile0) {
-            attrib_list[i].value |= VA_RT_FORMAT_YUV420_10;
-        }
-        i++;
-        *num_attribs = i;
-        return VA_STATUS_SUCCESS;
+        return nvenc_dispatch_query_config_attributes(cfg, attrib_list, num_attribs);
     }
 
     int i = 0;
@@ -1781,7 +1689,7 @@ static VAStatus nvCreateSurfaces2(
     }
 
     for (uint32_t i = 0; i < num_surfaces; i++) {
-        Object surfaceObject = allocateObject(drv, OBJECT_TYPE_SURFACE, sizeof(NVSurface));
+        Object surfaceObject = nvAllocateObject(drv, OBJECT_TYPE_SURFACE, sizeof(NVSurface));
         surfaces[i] = surfaceObject->id;
         NVSurface *suf = (NVSurface*) surfaceObject->obj;
         suf->width = width;
@@ -1925,7 +1833,7 @@ static VAStatus nvCreateContext(
     }
 
     if (cfg->entrypoint == VAEntrypointVideoProc) {
-        Object contextObj = allocateObject(drv, OBJECT_TYPE_CONTEXT, sizeof(NVContext));
+        Object contextObj = nvAllocateObject(drv, OBJECT_TYPE_CONTEXT, sizeof(NVContext));
         LOG("Creating VideoProc context id: %d", contextObj->id);
 
         NVContext *nvCtx = (NVContext*) contextObj->obj;
@@ -1953,69 +1861,8 @@ static VAStatus nvCreateContext(
     LOG("Creating context with %d render targets, at %dx%d (encode=%d)",
         num_render_targets, picture_width, picture_height, cfg->isEncode);
 
-    /* Encode context path */
     if (cfg->isEncode) {
-        NVENCContext *nvencCtx = (NVENCContext*) calloc(1, sizeof(NVENCContext));
-        if (nvencCtx == NULL) {
-            return VA_STATUS_ERROR_ALLOCATION_FAILED;
-        }
-
-        nvencCtx->width = picture_width;
-        nvencCtx->height = picture_height;
-        nvencCtx->maxWidth = picture_width;
-        nvencCtx->maxHeight = picture_height;
-        nvencCtx->inputFormat = nvenc_surface_format(cfg->profile, cfg->bitDepth);
-        nvencCtx->rcMode = cfg->rcMode;
-        nvencCtx->allowBframes = cfg->allowBframes;
-        nvencCtx->qualityLevel = 4;
-        nvencCtx->frameRateNum = 30;
-        nvencCtx->frameRateDen = 1;
-        nvencCtx->ipcFd = -1;
-        nvencCtx->shmPtr = NULL;
-        nvencCtx->shmSize = 0;
-        nvencCtx->shmFd = -1;
-
-        if (drv->cudaAvailable) {
-            /* Direct NVENC path (64-bit, CUDA works) */
-            if (CHECK_CUDA_RESULT(cu->cuCtxPushCurrent(drv->cudaContext))) {
-                free(nvencCtx);
-                return VA_STATUS_ERROR_OPERATION_FAILED;
-            }
-
-            if (!nvenc_open_session(nvencCtx, drv->nv, drv->cudaContext)) {
-                CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
-                free(nvencCtx);
-                return VA_STATUS_ERROR_OPERATION_FAILED;
-            }
-
-            if (CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL))) {
-                nvenc_close_session(nvencCtx);
-                free(nvencCtx);
-                return VA_STATUS_ERROR_OPERATION_FAILED;
-            }
-            nvencCtx->useIPC = false;
-        } else {
-            /* IPC path: CUDA unavailable (e.g. 32-bit on Blackwell).
-             * Encoding delegated to 64-bit nvenc-helper via Unix socket. */
-            LOG("Using IPC encode path (CUDA unavailable)");
-            nvencCtx->useIPC = true;
-        }
-
-        Object contextObj = allocateObject(drv, OBJECT_TYPE_CONTEXT, sizeof(NVContext));
-        NVContext *nvCtx = (NVContext*) contextObj->obj;
-        nvCtx->drv = drv;
-        nvCtx->profile = cfg->profile;
-        nvCtx->entrypoint = cfg->entrypoint;
-        nvCtx->width = picture_width;
-        nvCtx->height = picture_height;
-        nvCtx->isEncode = true;
-        nvCtx->encodeData = nvencCtx;
-        nvCtx->decoder = NULL;
-        nvCtx->codec = NULL;
-
-        *context = contextObj->id;
-        LOG("Created encode context id: %d, ipc=%d", contextObj->id, nvencCtx->useIPC);
-        return VA_STATUS_SUCCESS;
+        return nvenc_dispatch_create_context(drv, cfg, picture_width, picture_height, context);
     }
 
     //find the codec they've selected
@@ -2099,7 +1946,7 @@ static VAStatus nvCreateContext(
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
 
-    Object contextObj = allocateObject(drv, OBJECT_TYPE_CONTEXT, sizeof(NVContext));
+    Object contextObj = nvAllocateObject(drv, OBJECT_TYPE_CONTEXT, sizeof(NVContext));
     LOG("Creating decoder: %p for context id: %d", decoder, contextObj->id);
 
     NVContext *nvCtx = (NVContext*) contextObj->obj;
@@ -2263,7 +2110,7 @@ static VAStatus nvCreateBuffer(
         }
         coded->hasData = false;
 
-        Object bufferObject = allocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
+        Object bufferObject = nvAllocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
         *buf_id = bufferObject->id;
 
         NVBuffer *buf = (NVBuffer*) bufferObject->obj;
@@ -2287,7 +2134,7 @@ static VAStatus nvCreateBuffer(
     }
 
     //TODO should pool these as most of the time these should be the same size
-    Object bufferObject = allocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
+    Object bufferObject = nvAllocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
     *buf_id = bufferObject->id;
 
     NVBuffer *buf = (NVBuffer*) bufferObject->obj;
@@ -3498,7 +3345,7 @@ static VAStatus nvCreateImage(
         return VA_STATUS_ERROR_INVALID_IMAGE_FORMAT;
     }
 
-    Object imageObj = allocateObject(drv, OBJECT_TYPE_IMAGE, sizeof(NVImage));
+    Object imageObj = nvAllocateObject(drv, OBJECT_TYPE_IMAGE, sizeof(NVImage));
     image->image_id = imageObj->id;
 
     //LOG("created image id: %d", imageObj->id);
@@ -3510,7 +3357,7 @@ static VAStatus nvCreateImage(
 
     //allocate buffer to hold image when we copy down from the GPU
     //TODO could probably put these in a pool, they appear to be allocated, used, then freed
-    Object imageBufferObject = allocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
+    Object imageBufferObject = nvAllocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
     NVBuffer *imageBuffer = (NVBuffer*) imageBufferObject->obj;
     imageBuffer->bufferType = VAImageBufferType;
     imageBuffer->size = 0;
@@ -3590,7 +3437,7 @@ static VAStatus nvDeriveImage(
         }
 
         /* Create a buffer object for the image data (points to the surface's host memory) */
-        Object imageBufferObj = allocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
+        Object imageBufferObj = nvAllocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
         NVBuffer *imageBuf = (NVBuffer*) imageBufferObj->obj;
         imageBuf->bufferType = VAImageBufferType;
         imageBuf->size = totalSize;
@@ -3599,7 +3446,7 @@ static VAStatus nvDeriveImage(
         imageBuf->offset = (size_t)-1; /* Sentinel: don't free ptr on destroy */
 
         /* Create the image object */
-        Object imageObj = allocateObject(drv, OBJECT_TYPE_IMAGE, sizeof(NVImage));
+        Object imageObj = nvAllocateObject(drv, OBJECT_TYPE_IMAGE, sizeof(NVImage));
         NVImage *img = (NVImage*) imageObj->obj;
         img->width = width;
         img->height = height;
