@@ -929,36 +929,35 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
      * (Chrome's WebGL/canvas "video-processing" worker path, used to render
      * the local encode/capture preview) only advertise support for the
      * combined fourcc and reject the split layout with EGL_BAD_MATCH. The
-     * normal decode-display zero-copy import path, on the other hand,
-     * expects (and must keep getting) the split per-plane layer form. It
-     * requires a single-buffer backing image, so it only applies when
+     * normal decode-display zero-copy import path expects (and must keep
+     * getting) the split per-plane layer form. COMBINED requires a
+     * single-buffer backing image, so it only applies when
      * img->isSingleBuffer is true.
      *
-     * In AUTO mode (the default) this decision is made per-surface instead
-     * of globally: surfaces that belong to an encode context (local
-     * capture/preview, which Chrome imports through the WebGL/canvas
-     * worker path) use the combined layer; surfaces that belong to a
-     * decode context (remote/video display) keep the split layer. This is
-     * exactly the encode-vs-decode split observed in practice: forcing
-     * COMBINED globally fixed the local AV1 preview but broke remote
-     * decode display, and vice versa for SINGLE/MULTI. Explicitly setting
-     * NVD_DESCRIPTOR_MODE=single/multi/combined overrides this and forces
-     * that layout for every surface, as before.
+     * In AUTO mode (the default) the decision is made per-surface using
+     * the deterministic isEncode flag on the surface's context:
+     *   - encode context (local capture/preview) → COMBINED
+     *   - decode context (remote peer, video playback)      → SINGLE
+     * Explicitly setting NVD_DESCRIPTOR_MODE=single/multi/combined forces
+     * that layout for every surface and overrides AUTO.
      *
-     * One decode-context case still needs the combined layer, though:
-     * Chrome sometimes renders a local screenshare/camera self-preview by
-     * decoding its own just-encoded stream back (rather than reusing the
-     * pre-encode frame), which goes through the exact same WebGL/canvas
-     * worker importer as the encode-preview path and hits the same
-     * EGL_BAD_MATCH otherwise. There is no VA-API-visible flag telling us
-     * "this decode is a self-preview", but such a decode context is always
-     * created at exactly the same resolution as the local encode context
-     * it is re-decoding — a genuine remote peer's video is essentially
-     * never encoded at that exact pixel size. So a decode surface whose
-     * resolution matches a currently-active local encode context is also
-     * treated as combined. */
+     * Historical note: AUTO used to also treat a decode surface at the
+     * same resolution as an active encode context as a "self-preview" and
+     * exported it as COMBINED — the theory being that Chrome sometimes
+     * decodes its own just-encoded stream back for the local preview
+     * thumbnail, and that path (going through the same WebGL importer as
+     * the encode-preview path) needs COMBINED. In practice this heuristic
+     * false-triggered on every real WebRTC call: video-conferencing
+     * clients negotiate peers to the local camera's resolution
+     * (720p/540p/360p simulcast rungs), so a remote peer's decoded
+     * surface almost always matches a live local encode context — and
+     * mis-classifying it as a self-preview made Chrome's normal
+     * decode-display importer render that peer with green macroblock
+     * corruption. The heuristic is now off by AUTO default and lives
+     * behind NVD_SELF_PREVIEW_COMBINED=1 for the rare users who need it. */
     const bool isEncodeSurface = surface->context != NULL && surface->context->isEncode;
-    const bool isSelfPreviewDecode = !isEncodeSurface &&
+    const bool isSelfPreviewDecode = drv->selfPreviewCombinedOptIn &&
+        !isEncodeSurface &&
         nvHasActiveEncodeContextWithResolution(drv, surface->width, surface->height);
     const bool wantsCombined = drv->descriptorMode == DESCRIPTOR_MODE_COMBINED ||
                                 (drv->descriptorMode == DESCRIPTOR_MODE_AUTO &&

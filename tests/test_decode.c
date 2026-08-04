@@ -238,18 +238,22 @@ static void test_av1_decode_combined_descriptor_mode(void)
     TEST_PASS();
 }
 
-/* AUTO mode (the default) picks the export layout per-surface based on
- * context type: encode-context surfaces get the combined layer, decode-
- * context surfaces get the split layer — except a decode surface created
- * at exactly the same resolution as a currently-active local encode
- * context, which is treated as a self-preview (Chrome re-decoding its own
- * outgoing stream for a thumbnail) and also gets the combined layer. A
- * decode surface at any other resolution is genuine remote video and must
- * keep the split layout the browser's normal decode-display importer
- * needs. */
-static void test_decode_auto_mode_self_preview_combined(void)
+/* AUTO mode (the default) picks the export layout per-surface using the
+ * deterministic isEncode flag on the surface's context:
+ *   - encode context (local capture/preview) → COMBINED layer
+ *   - decode context (remote peer, video playback)      → SPLIT layers
+ * The legacy resolution-match self-preview heuristic (which used to also
+ * force COMBINED on a decode surface whose size happened to match an
+ * active encode context, on the theory that it was Chrome's decode-back
+ * self-preview thumbnail) is off by default in AUTO — it false-triggered
+ * on every real WebRTC call because peers negotiate to the local camera's
+ * resolution, and mis-classifying those peers as self-previews produced
+ * green macroblock corruption in Chrome's normal decode-display importer.
+ * It's still available behind NVD_SELF_PREVIEW_COMBINED=1 for the rare
+ * users who need Chrome's decode-back self-preview path. */
+static void test_decode_auto_mode_split_for_all_decodes(void)
 {
-    TEST_START("AUTO mode: decode surface matching active encode res gets combined layer (self-preview)");
+    TEST_START("AUTO mode: decode surface stays SPLIT even with matching encode context");
 
     VAConfigAttrib enc_attr = { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 };
     VAConfigID enc_config;
@@ -276,27 +280,30 @@ static void test_decode_auto_mode_self_preview_combined(void)
     st = vaCreateConfig(dpy, VAProfileAV1Profile0, VAEntrypointVLD, &dec_attr, 1, &dec_config);
     TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateConfig (decode) failed");
 
-    /* Decode surface at the SAME resolution as the active encode context
-     * above — this is the self-preview case and should get the combined
-     * (single-layer) export, just like an encode surface would. */
-    VASurfaceID self_preview_surface;
-    st = vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, 640, 480, &self_preview_surface, 1, NULL, 0);
-    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateSurfaces (self-preview decode) failed");
+    /* Decode surface at the SAME resolution as the live encode context above
+     * — used to be classified as "self-preview" and forced to COMBINED, but
+     * that's exactly the case that made remote WebRTC peers render as green
+     * macroblocks. AUTO must return SPLIT (num_layers == 2) here. */
+    VASurfaceID matching_decode_surface;
+    st = vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, 640, 480, &matching_decode_surface, 1, NULL, 0);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateSurfaces (matching decode) failed");
 
-    VAContextID self_preview_context;
-    st = vaCreateContext(dpy, dec_config, 640, 480, VA_PROGRESSIVE, &self_preview_surface, 1, &self_preview_context);
-    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateContext (self-preview decode) failed");
+    VAContextID matching_decode_context;
+    st = vaCreateContext(dpy, dec_config, 640, 480, VA_PROGRESSIVE, &matching_decode_surface, 1, &matching_decode_context);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateContext (matching decode) failed");
 
     VADRMPRIMESurfaceDescriptor desc;
-    st = vaExportSurfaceHandle(dpy, self_preview_surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+    st = vaExportSurfaceHandle(dpy, matching_decode_surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
                                VA_EXPORT_SURFACE_SEPARATE_LAYERS, &desc);
-    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaExportSurfaceHandle (self-preview) failed");
-    TEST_ASSERT(desc.num_layers == 1,
-                "decode surface matching an active encode context's resolution should use the combined layer");
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaExportSurfaceHandle (matching) failed");
+    TEST_ASSERT(desc.num_layers == 2,
+                "AUTO must NOT force COMBINED on a decode surface just because "
+                "it matches an encode resolution — that's the WebRTC-peer "
+                "green-macroblock regression");
     for (int i = 0; i < desc.num_objects; i++) close(desc.objects[i].fd);
 
     /* Decode surface at a DIFFERENT resolution — genuine remote video —
-     * must keep the split per-plane layout. */
+     * must also keep the split per-plane layout. */
     VASurfaceID remote_surface;
     st = vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, 1280, 720, &remote_surface, 1, NULL, 0);
     TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateSurfaces (remote decode) failed");
@@ -315,8 +322,8 @@ static void test_decode_auto_mode_self_preview_combined(void)
 
     vaDestroySurfaces(dpy, &remote_surface, 1);
     vaDestroyContext(dpy, remote_context);
-    vaDestroySurfaces(dpy, &self_preview_surface, 1);
-    vaDestroyContext(dpy, self_preview_context);
+    vaDestroySurfaces(dpy, &matching_decode_surface, 1);
+    vaDestroyContext(dpy, matching_decode_context);
     vaDestroyConfig(dpy, dec_config);
     vaDestroyContext(dpy, enc_context);
     vaDestroySurfaces(dpy, &enc_surface, 1);
@@ -335,7 +342,7 @@ int main()
     test_av1_decode_combined_rtformat();
     test_av1_decode_export();
     test_av1_decode_combined_descriptor_mode();
-    test_decode_auto_mode_self_preview_combined();
+    test_decode_auto_mode_split_for_all_decodes();
 
     teardown();
     printf("\n=== Results: %d passed, %d failed ===\n\n", pass_count, fail_count);

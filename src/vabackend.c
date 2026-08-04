@@ -550,18 +550,25 @@ int pictureIdxFromSurfaceId(NVDriver *drv, VASurfaceID surfId) {
     return -1;
 }
 
-/* Used by the DESCRIPTOR_MODE_AUTO export-layout heuristic
- * (direct_fillExportDescriptor()) to tell apart a decode surface that is a
- * local self-preview (Chrome re-decoding its own outgoing encoded stream to
- * render a thumbnail) from one that is genuinely a remote peer's video.
+/* Used by the legacy self-preview heuristic in the DESCRIPTOR_MODE_AUTO
+ * export path (direct_fillExportDescriptor()). Returns true if any active
+ * OBJECT_TYPE_CONTEXT is an encode context whose resolution matches the
+ * given width/height.
  *
- * VA-API gives no explicit signal for this, but a decode context created at
- * exactly the same resolution as a currently-active local encode context is,
- * in practice, always this self-preview case: a remote peer's video is
- * essentially never encoded at the exact same pixel dimensions as your own
- * outgoing capture. So if any active OBJECT_TYPE_CONTEXT is an encode
- * context with a matching width/height, treat the decode surface the same
- * way encode surfaces are treated (combined export layout). */
+ * Originally added to catch Chrome's decode-back self-preview thumbnail
+ * (Chrome sometimes decodes its own outgoing encoded stream to render the
+ * local preview, and that path needs the COMBINED export layout to avoid
+ * EGL_BAD_MATCH in Chrome's WebGL importer). The original assumption was
+ * "a remote peer's video is never encoded at the exact same dimensions as
+ * your own outgoing capture" — which turned out to be false for real
+ * WebRTC calls: peers negotiate to the local camera's rungs
+ * (720p/540p/360p simulcast), so almost every remote decoded surface
+ * matches a live local encode context and used to false-trigger this
+ * heuristic, producing green macroblock corruption on peers.
+ *
+ * The heuristic is now gated behind NVD_SELF_PREVIEW_COMBINED=1
+ * (NVDriver.selfPreviewCombinedOptIn); this function is only called when
+ * that opt-in is active. */
 bool nvHasActiveEncodeContextWithResolution(NVDriver *drv, uint32_t width, uint32_t height) {
     bool found = false;
     pthread_mutex_lock(&drv->objectCreationMutex);
@@ -4354,12 +4361,16 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         (uint32_t) parseEnvU64("NVD_MAX_DETACHED_BACKING_IMAGES", DEFAULT_MAX_DETACHED_BACKING_IMAGES);
 
     /* Default (unset or "auto") lets the driver pick the per-surface layout
-     * on its own: encode-context surfaces (local capture/preview) get the
-     * COMBINED layout, decode-context surfaces (remote/video display) get
-     * the SINGLE (split-layer) layout — see DESCRIPTOR_MODE_AUTO and its
-     * use in direct_allocateBackingImage()/direct_fillExportDescriptor().
+     * on its own using the deterministic isEncode flag: encode-context
+     * surfaces (local capture/preview, Chrome's WebGL importer path) get
+     * COMBINED; decode-context surfaces (remote peer / video playback,
+     * Chrome's normal decode-display importer path) get SINGLE. See
+     * DESCRIPTOR_MODE_AUTO and direct_fillExportDescriptor().
      * Explicitly setting single/multi/combined forces that layout for every
-     * surface, overriding the automatic per-surface decision. */
+     * surface, overriding the automatic per-surface decision.
+     * Set NVD_SELF_PREVIEW_COMBINED=1 to re-enable the legacy
+     * resolution-match self-preview heuristic (rarely wanted; see notes on
+     * NVDriver.selfPreviewCombinedOptIn). */
     const char *modeEnv = getenv("NVD_DESCRIPTOR_MODE");
     if (modeEnv != NULL && strcmp(modeEnv, "single") == 0) {
         drv->descriptorMode = DESCRIPTOR_MODE_SINGLE;
@@ -4376,6 +4387,16 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     LOG("Descriptor mode: %s", drv->descriptorMode == DESCRIPTOR_MODE_SINGLE ? "single" :
         drv->descriptorMode == DESCRIPTOR_MODE_COMBINED ? "combined" :
         drv->descriptorMode == DESCRIPTOR_MODE_AUTO ? "auto" : "multi")
+
+    /* Legacy self-preview heuristic opt-in. See NVDriver.selfPreviewCombinedOptIn
+     * and direct_fillExportDescriptor() for why this is off by default. */
+    const char *selfPreviewEnv = getenv("NVD_SELF_PREVIEW_COMBINED");
+    drv->selfPreviewCombinedOptIn = selfPreviewEnv != NULL &&
+                                     strcmp(selfPreviewEnv, "1") == 0;
+    if (drv->selfPreviewCombinedOptIn) {
+        LOG("NVD_SELF_PREVIEW_COMBINED=1: AUTO decode surfaces matching an "
+            "active encode context resolution will be exported as COMBINED");
+    }
 
     nvStatsInit(drv);
 

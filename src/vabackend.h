@@ -202,6 +202,16 @@ typedef struct _NVDriver
     bool                    nvencAvailable;
     bool                    cudaAvailable;  /* false when 32-bit CUDA fails */
     DescriptorMode          descriptorMode;
+    /* Opt-in (NVD_SELF_PREVIEW_COMBINED=1): re-enable the legacy AUTO
+     * resolution-match heuristic that treats a decode surface at the same
+     * resolution as an active encode context as a "self-preview" and gives
+     * it the COMBINED layout. Off by default because real WebRTC calls
+     * negotiate peers to the same resolution as the local camera and the
+     * heuristic then false-triggered on every remote peer, showing green
+     * macroblock corruption in Chrome's normal decode-display importer.
+     * Only enable this if you specifically rely on Chrome's decode-back
+     * self-preview path (rare). */
+    bool                    selfPreviewCombinedOptIn;
     CUmodule                videoProcModule;
     CUfunction              nv12ToArgbKernel;
     CUfunction              p010ToArgbKernel;

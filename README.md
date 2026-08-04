@@ -263,14 +263,10 @@ surface belongs to an encode context or a decode context:
 - Decode-context surfaces (the normal remote/received-video display path) are
   exported as one split single-channel layer per plane (`R8`/`GR88`), which is
   what Chromium's decode-display zero-copy importer expects.
-- A decode-context surface whose resolution exactly matches a currently-active
-  local encode context's resolution is also exported with the combined layer.
-  This covers Chrome re-decoding its own just-encoded stream to render a local
-  self-preview/thumbnail, which goes through the same WebGL/canvas worker
-  importer as an encode surface even though it is technically a decode
-  context — a genuine remote peer's video is essentially never encoded at the
-  exact same pixel dimensions as your own outgoing capture, so this heuristic
-  does not affect real inbound video.
+
+That's the whole rule: it uses the deterministic `isEncode` flag on the
+surface's VA-API context and nothing else. No resolution guessing, no
+inference from other live contexts.
 
 This matters because Chrome's two consumers of an exported DMA-BUF want
 different layouts on the same GPU/driver/ANGLE combination:
@@ -293,17 +289,33 @@ object), `multi` (split layer, one DMA-BUF object per plane), or `combined`
 Check `NVD_LOG=1` for the `Descriptor mode: ...` line to confirm which mode is
 active.
 
-> **Known caveat:** the automatic decision is based on VA-API context type
-> (encode vs. decode) plus the resolution-matching heuristic above, which are
-> the only signals the driver has access to — there is no VA-API flag that
-> says "this decode is a local self-preview". In the unlikely case a decode
-> surface's resolution *happens* to coincide with an unrelated remote peer's
-> resolution, or a self-preview is rendered at a resolution that doesn't
-> exactly match the local encode context, this can still misclassify a
-> surface. If you find a specific decode surface still needs the combined
-> layout (or the opposite), forcing `NVD_DESCRIPTOR_MODE=combined`/`single`/
-> `multi` remains available as a manual override, at the cost of that mode's
-> known trade-off for the other surface type.
+> **Known caveat:** encode-vs-decode is the only signal we have. There's no
+> VA-API flag that says "this decode is a local self-preview," so a workflow
+> that relies on Chrome's decode-back self-preview path (Chrome decoding its
+> own just-encoded stream back to render the local thumbnail) will import
+> that surface as SINGLE and hit `EGL_BAD_MATCH` in the WebGL/canvas worker.
+> If that describes your setup, either force `NVD_DESCRIPTOR_MODE=combined`
+> globally (at the cost of remote decode display), or set
+> `NVD_SELF_PREVIEW_COMBINED=1` (see below).
+
+#### `NVD_SELF_PREVIEW_COMBINED=1` (opt-in escape hatch)
+
+Previously the AUTO default *also* forced COMBINED on any decode surface
+whose resolution matched a currently-active local encode context, on the
+theory that this was always Chrome's decode-back self-preview thumbnail.
+That assumption turned out to be wrong for real WebRTC meetings: video
+platforms (Meet, Zoom, Slack, corporate tools) negotiate every peer to
+common resolutions (720p / 540p / 360p simulcast rungs) — so every remote
+peer whose incoming stream happens to be at your camera's resolution was
+mis-classified as a self-preview and rendered with **green macroblock
+corruption** in Chrome's normal decode-display importer.
+
+The resolution-match heuristic is therefore off by default. Set
+`NVD_SELF_PREVIEW_COMBINED=1` to re-enable it if you rely specifically on
+Chrome's decode-back self-preview path (rare — most WebRTC apps render the
+local thumbnail directly from `getUserMedia` without touching the encoder).
+When set, an `NVD_LOG=1` line at driver init confirms it's active. Leave
+unset (the default) for any normal video-conferencing setup.
 
 ### Encoder restart delay after stopping/switching screenshare
 
@@ -380,7 +392,8 @@ Individual harnesses:
 
 | Binary / script | What it covers |
 |---|---|
-| `test_decode` | AV1 (8-bit + 10-bit) decode init, combined-RTFormat resolution, DMA-BUF export, auto descriptor mode / self-preview heuristic. |
+| `test_decode` | AV1 (8-bit + 10-bit) decode init, combined-RTFormat resolution, DMA-BUF export, auto descriptor mode (asserts decode surfaces stay SPLIT even when a same-res encode context is live — the WebRTC-peer green-macroblock regression guard). |
+| `test_descriptor_mode` | Standalone regression for the AUTO descriptor-mode contract: decode-only surface → SPLIT; decode + concurrent encode @ same res → SPLIT (no green macroblocks on peers); with `NVD_SELF_PREVIEW_COMBINED=1` → same case flips to COMBINED (opt-in fallback). |
 | `test_encode` | Encode entrypoints, config attributes, single-frame encode for H.264 / HEVC / HEVC Main10 / AV1 / AV1 Main10, rate control + quality-level params, AV1 temporal SVC and combined-RTFormat encode, dynamic resolution, sequential encodes, coded-buffer reuse, long-running single session, live bitrate/framerate reconfigure, auto-combined encode export, decode-still-works co-existence, dimension-mismatch, H.264 B-frames. |
 | `test_encode_config` | Config-side coverage: entrypoints, RTFormat, rate control, packed headers, ref frames, max dimensions, quality range, surface allocation (NV12 / P010 / small / 4K), export descriptor. |
 | `test_ipc_fuzz` | Fuzz surface for the NVENC out-of-process IPC helper (invalid commands, truncated inits, oversized payloads, rapid connect/disconnect, double-init, encode-without-init). |
@@ -483,9 +496,15 @@ efortin PR #427 base and elFarto's upstream master. See
   `update-nvenc.sh`.
 - **Chrome-compatible DMA-BUF descriptor mode** — `NVD_DESCRIPTOR_MODE` env
   var (default `auto`), picks per-surface layout for encode-context vs.
-  decode-context surfaces, with a resolution-matching heuristic that also
-  routes a decode surface through the combined-fourcc path when it's a
-  self-preview of a currently active local encode.
+  decode-context surfaces using the deterministic `isEncode` flag on the
+  VA-API context. **AUTO no longer uses the resolution-matching self-preview
+  heuristic** (was disproven by real WebRTC calls: peers negotiate to the
+  local camera's resolution and the heuristic false-triggered on every
+  remote peer, producing green macroblock corruption in Chrome's normal
+  decode-display importer). The legacy behavior is available behind
+  `NVD_SELF_PREVIEW_COMBINED=1` for anyone who specifically depends on
+  Chrome's decode-back self-preview path. Regression pinned by
+  `tests/test_descriptor_mode.c`.
 - **Live rate-control / framerate reconfigure** — mid-session
   `VAEncMiscParameterTypeRateControl` /
   `VAEncMiscParameterTypeFrameRate` are applied through
