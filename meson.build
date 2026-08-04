@@ -142,6 +142,12 @@ if not meson.is_cross_build()
         dependencies : libva_test_deps, install : false)
     test('descriptor_mode', test_descriptor_mode, timeout : 60, env : test_env)
 
+    test_concurrent = executable('test_concurrent_sessions',
+        'tests/test_concurrent_sessions.c',
+        dependencies : libva_test_deps + [dependency('threads')],
+        install : false)
+    test('concurrent_sessions', test_concurrent, timeout : 120, env : test_env)
+
     # Opt-in coverage: re-runs descriptor_mode with the escape hatch active
     # to pin the fallback behavior we promise in the README.
     test_env_selfpreview = environment({
