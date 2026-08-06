@@ -9,6 +9,7 @@
  * vabackend.c leave this file untouched.
  */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -508,6 +509,28 @@ VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx)
         coded->hasData = true;
         LOG("Encode: frame %lu encoded, %u bytes",
             (unsigned long)(nvencCtx->frameCount - 1), bitstreamSize);
+        /* Diagnostic: NVD_ENC_DUMP_FILE=/path append-writes every encoded
+         * frame's raw bytestream. Used to capture what our encoder emits
+         * in real WebRTC / Chrome sessions, so we can decode the same
+         * bytes with an external decoder (libdav1d, ffmpeg) and rule the
+         * encoder in or out for corruption bugs the ffmpeg roundtrip test
+         * doesn't reproduce. Elementary-stream append — for AV1 raw OBU,
+         * H.264/HEVC Annex-B — decoders don't need framing since NAL /
+         * OBU headers carry it. Guaranteed serial (single encoder session
+         * per file); concurrent encoders should point at different
+         * files. Overhead is one fopen(a) + fwrite + fclose per frame,
+         * negligible next to the encode itself, but obviously wrong for
+         * production — keep the env unset unless investigating. */
+        const char *dumpPath = getenv("NVD_ENC_DUMP_FILE");
+        if (dumpPath != NULL && dumpPath[0] != '\0') {
+            FILE *df = fopen(dumpPath, "ab");
+            if (df != NULL) {
+                fwrite(coded->bitstreamData, 1, bitstreamSize, df);
+                fclose(df);
+            } else {
+                LOG("NVD_ENC_DUMP_FILE: could not open %s for append", dumpPath);
+            }
+        }
     } else {
         LOG("Encode: WARNING - no coded buffer found for id %d", nvencCtx->currentCodedBufId);
     }
