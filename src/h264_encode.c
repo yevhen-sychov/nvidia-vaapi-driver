@@ -47,14 +47,21 @@ void h264enc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 
     /* Only log first few frames to avoid flooding at 60fps */
     if (nvencCtx->frameCount < 3) {
-        LOG("H264 encode: picture params, coded_buf=%d, pic_fields=0x%x",
-            pic->coded_buf, pic->pic_fields.value);
+        LOG("H264 encode: picture params, coded_buf=%d, pic_fields=0x%x, pic_init_qp=%u",
+            pic->coded_buf, pic->pic_fields.value, pic->pic_init_qp);
     }
 
     nvencCtx->currentCodedBufId = pic->coded_buf;
     nvencCtx->forceIDR = (pic->pic_fields.bits.idr_pic_flag != 0);
     if (nvencCtx->forceIDR) {
         LOG("H264 encode: IDR requested, coded_buf=%d", pic->coded_buf);
+    }
+    /* Per-picture CQP hint. Client may override QP frame-by-frame via
+     * pic_init_qp; in CONSTQP mode nvenc_reconfigure_if_needed picks this
+     * up before the next encode and updates NVENC constQP via
+     * nvEncReconfigureEncoder. */
+    if (pic->pic_init_qp > 0) {
+        nvencCtx->picQP = pic->pic_init_qp;
     }
 }
 
@@ -90,8 +97,10 @@ void h264enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     case VAEncMiscParameterTypeRateControl: {
         VAEncMiscParameterRateControl *rc =
             (VAEncMiscParameterRateControl*) misc->data;
-        LOG("H264 encode: rate control bits_per_second=%u, target_percentage=%u",
-            rc->bits_per_second, rc->target_percentage);
+        LOG("H264 encode: rate control bits_per_second=%u, target_percentage=%u, "
+            "qp{init=%u, min=%u, max=%u}",
+            rc->bits_per_second, rc->target_percentage,
+            rc->initial_qp, rc->min_qp, rc->max_qp);
         if (rc->bits_per_second > 0) {
             nvencCtx->maxBitrate = rc->bits_per_second;
             if (rc->target_percentage > 0) {
@@ -100,6 +109,9 @@ void h264enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
                 nvencCtx->bitrate = rc->bits_per_second;
             }
         }
+        if (rc->initial_qp > 0) nvencCtx->initialQP = rc->initial_qp;
+        if (rc->min_qp > 0)     nvencCtx->minQP     = rc->min_qp;
+        if (rc->max_qp > 0)     nvencCtx->maxQP     = rc->max_qp;
         break;
     }
     case VAEncMiscParameterTypeFrameRate: {

@@ -92,6 +92,9 @@ void av1enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
                 nvencCtx->bitrate = rc->bits_per_second;
             }
         }
+        if (rc->initial_qp > 0) nvencCtx->initialQP = rc->initial_qp;
+        if (rc->min_qp > 0)     nvencCtx->minQP     = rc->min_qp;
+        if (rc->max_qp > 0)     nvencCtx->maxQP     = rc->max_qp;
         break;
     }
     case VAEncMiscParameterTypeFrameRate: {

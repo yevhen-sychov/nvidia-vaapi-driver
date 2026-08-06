@@ -839,9 +839,15 @@ static VAStatus nvQueryConfigEntrypoints(
         entrypoint_list[count++] = VAEntrypointVLD;
     }
 
-    /* Encode entrypoint — supported for H.264 and HEVC if NVENC is available */
-    if (drv->nvencAvailable && nvenc_is_encode_profile(profile)) {
-        entrypoint_list[count++] = VAEntrypointEncSlice;
+    /* Encode entrypoint — supported for H.264 / HEVC / AV1 profiles that
+     * (a) the fork implements, AND (b) the runtime NVENC probe confirmed
+     * this box actually accepts. Probing is lazy; the check falls back to
+     * the historical hardcoded list until first call. */
+    if (drv->nvencAvailable) {
+        nvenc_probe_caps(drv);
+        if (nvenc_is_encode_profile_supported(drv, profile)) {
+            entrypoint_list[count++] = VAEntrypointEncSlice;
+        }
     }
 
     *num_entrypoints = count;
@@ -937,7 +943,8 @@ static VAStatus nvGetConfigAttributes(
     }
 
     if (entrypoint == VAEntrypointEncSlice) {
-        if (!drv->nvencAvailable || !nvenc_is_encode_profile(profile)) {
+        nvenc_probe_caps(drv);
+        if (!drv->nvencAvailable || !nvenc_is_encode_profile_supported(drv, profile)) {
             return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
         }
         nvGetConfigAttributesEncode(profile, attrib_list, num_attribs);

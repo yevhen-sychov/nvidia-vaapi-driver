@@ -212,6 +212,27 @@ typedef struct _NVDriver
      * Only enable this if you specifically rely on Chrome's decode-back
      * self-preview path (rare). */
     bool                    selfPreviewCombinedOptIn;
+    /*
+     * NVENC capability probe results. Populated once, lazily, on the first
+     * encode-config query. Used to gate profile advertisement so we don't
+     * advertise (e.g.) HEVC Main422_10 on hardware that lacks YUV422
+     * encode. All bools default to false; nvencCapsProbed guards against
+     * duplicate probe work.
+     */
+    bool                    nvencCapsProbed;
+    bool                    nvencSupportsH264;
+    bool                    nvencSupportsH264High10;
+    bool                    nvencSupportsHEVC;
+    bool                    nvencSupportsHEVCMain10;
+    bool                    nvencSupportsHEVCFrext;      /* umbrella cap for 422/444 profiles */
+    bool                    nvencSupportsAV1;
+    bool                    nvencSupportsAV1_10bit;
+    /* Input format caps — from NV_ENC_CAPS_SUPPORT_10BIT_ENCODE /
+     * SUPPORT_YUV444_ENCODE per codec, plus SupportedInputFormat scan. */
+    bool                    nvencSupportsInputYUV444;
+    bool                    nvencSupportsInputYUV444_10;
+    bool                    nvencSupportsInputYUV422;    /* NV16 / P210 */
+    bool                    nvencSupportsInputYUV422_10;
     CUmodule                videoProcModule;
     CUfunction              nv12ToArgbKernel;
     CUfunction              p010ToArgbKernel;

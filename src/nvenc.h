@@ -82,6 +82,21 @@ typedef struct {
     uint32_t                        appliedMaxBitrate;
     uint32_t                        appliedFrameRateNum;
     uint32_t                        appliedFrameRateDen;
+    /*
+     * QP hints. VAEncMiscParameterRateControl carries initial_qp / min_qp /
+     * max_qp for CBR/VBR (bound the encoder's QP range) and CQP (initial_qp
+     * seeds the constant QP). VAEncPictureParameterBuffer's pic_init_qp
+     * (H.264) and init_qp (HEVC) can override per-picture for CQP.
+     * 0 means "unset / use NVENC default".
+     */
+    uint32_t                        initialQP;
+    uint32_t                        minQP;
+    uint32_t                        maxQP;
+    /* Per-picture QP override for the next frame (CQP path). */
+    uint32_t                        picQP;
+    /* Last CONSTQP value actually programmed via init/reconfigure; used to
+     * detect per-picture QP changes and issue nvEncReconfigureEncoder. */
+    uint32_t                        appliedConstQP;
 } NVENCContext;
 
 // Wraps VACodedBufferSegment with NVENC bitstream storage
@@ -98,6 +113,24 @@ void nvenc_unload(NvencFunctions **nvenc_dl);
 
 bool nvenc_open_session(NVENCContext *nvencCtx, NvencFunctions *nvenc_dl, CUcontext cudaCtx);
 void nvenc_close_session(NVENCContext *nvencCtx);
+
+struct _NVDriver;
+/*
+ * Probe NVENC for supported codec GUIDs, profile GUIDs, input formats and
+ * per-codec caps (10-bit, YUV444, YUV422). Opens a temporary NVENC session,
+ * queries via nvEncGetEncodeGUIDs / nvEncGetEncodeProfileGUIDs /
+ * nvEncGetSupportedInputFormats / nvEncGetEncodeCaps, then closes it.
+ * Populates drv->nvenc*Supports* fields and sets drv->nvencCapsProbed=true.
+ * Idempotent — a second call returns immediately.
+ *
+ * Requires drv->cudaAvailable == true. On CUDA-less builds (32-bit / IPC
+ * fallback) probing is skipped and all caps stay false; the fallback
+ * hardcoded list in nvenc_is_encode_profile still applies.
+ *
+ * Called lazily from nvenc_dispatch_create_config the first time an encode
+ * profile is queried.
+ */
+bool nvenc_probe_caps(struct _NVDriver *drv);
 
 bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
                         GUID codecGuid, GUID profileGuid,
@@ -132,9 +165,35 @@ int nvenc_encode_frame(NVENCContext *nvencCtx, NV_ENC_INPUT_PTR inputBuffer,
 bool nvenc_lock_bitstream(NVENCContext *nvencCtx, void **outPtr, uint32_t *outSize);
 bool nvenc_unlock_bitstream(NVENCContext *nvencCtx);
 
+/*
+ * Static allowlist of encode profiles the fork implements. Says nothing
+ * about whether the underlying hardware/driver actually accepts them —
+ * that requires nvenc_is_encode_profile_supported() plus a probed caps
+ * struct.
+ */
 bool nvenc_is_encode_profile(VAProfile profile);
+/*
+ * True iff (a) profile is in the static allowlist AND (b) the runtime
+ * capability probe found that NVENC on this box actually supports it —
+ * codec GUID present, profile GUID present, required input format
+ * present. Falls back to the static allowlist behavior when caps aren't
+ * probed (drv->nvencCapsProbed == false), which happens on CUDA-less /
+ * IPC-only builds.
+ */
+bool nvenc_is_encode_profile_supported(struct _NVDriver *drv, VAProfile profile);
 GUID nvenc_va_profile_to_codec_guid(VAProfile profile);
 GUID nvenc_va_profile_to_profile_guid(VAProfile profile);
+/*
+ * Chroma layout advertised by a VA-API profile (YUV420 / YUV422 /
+ * YUV444). Used to advertise the correct VAConfigAttribRTFormat mask and
+ * to choose the right NVENC input buffer format.
+ */
+typedef enum {
+    NVENC_CHROMA_420 = 0,
+    NVENC_CHROMA_422,
+    NVENC_CHROMA_444,
+} NvencChromaFormat;
+NvencChromaFormat nvenc_profile_chroma(VAProfile profile);
 NV_ENC_BUFFER_FORMAT nvenc_surface_format(VAProfile profile, int bitDepth);
 
 /*

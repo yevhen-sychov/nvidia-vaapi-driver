@@ -157,13 +157,38 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
     nvencCtx->encodeConfig.profileGUID = profileGuid;
 
     if (memcmp(&codecGuid, &NV_ENC_CODEC_HEVC_GUID, sizeof(GUID)) == 0) {
-        if (memcmp(&profileGuid, &NV_ENC_HEVC_PROFILE_MAIN10_GUID, sizeof(GUID)) == 0) {
-            nvencCtx->encodeConfig.encodeCodecConfig.hevcConfig.inputBitDepth = NV_ENC_BIT_DEPTH_10;
-            nvencCtx->encodeConfig.encodeCodecConfig.hevcConfig.outputBitDepth = NV_ENC_BIT_DEPTH_10;
-        } else {
-            nvencCtx->encodeConfig.encodeCodecConfig.hevcConfig.inputBitDepth = NV_ENC_BIT_DEPTH_8;
-            nvencCtx->encodeConfig.encodeCodecConfig.hevcConfig.outputBitDepth = NV_ENC_BIT_DEPTH_8;
+        NV_ENC_CONFIG_HEVC *hevc = &nvencCtx->encodeConfig.encodeCodecConfig.hevcConfig;
+        /* Bit depth: 10-bit for any format whose input buffer is 10-bit
+         * (P010 for 4:2:0, P210 for 4:2:2, YUV444_10 for 4:4:4). */
+        bool is10 = (nvencCtx->inputFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT ||
+                     nvencCtx->inputFormat == NV_ENC_BUFFER_FORMAT_P210 ||
+                     nvencCtx->inputFormat == NV_ENC_BUFFER_FORMAT_YUV444_10BIT);
+        hevc->inputBitDepth  = is10 ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+        hevc->outputBitDepth = is10 ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+        /* Chroma format: NV12/P010 → 4:2:0 (IDC=1), NV16/P210 → 4:2:2
+         * (IDC=2), YUV444/YUV444_10 → 4:4:4 (IDC=3). The FREXT profile
+         * GUID accepts any of 2/3; Main/Main10 GUIDs must stay on IDC=1. */
+        switch (nvencCtx->inputFormat) {
+        case NV_ENC_BUFFER_FORMAT_NV16:
+        case NV_ENC_BUFFER_FORMAT_P210:
+            hevc->chromaFormatIDC = 2;
+            break;
+        case NV_ENC_BUFFER_FORMAT_YUV444:
+        case NV_ENC_BUFFER_FORMAT_YUV444_10BIT:
+            hevc->chromaFormatIDC = 3;
+            break;
+        default:
+            hevc->chromaFormatIDC = 1;
+            break;
         }
+    }
+
+    if (memcmp(&codecGuid, &NV_ENC_CODEC_H264_GUID, sizeof(GUID)) == 0) {
+        /* H.264 High10 encode uses P010 input; NV_ENC_CONFIG_H264 doesn't
+         * have separate bit-depth fields (the profile GUID carries it),
+         * but we still pin chromaFormatIDC=1 explicitly for clarity. */
+        NV_ENC_CONFIG_H264 *h264 = &nvencCtx->encodeConfig.encodeCodecConfig.h264Config;
+        h264->chromaFormatIDC = 1;
     }
 
     if (memcmp(&codecGuid, &NV_ENC_CODEC_AV1_GUID, sizeof(GUID)) == 0) {
@@ -219,6 +244,41 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
         nvencCtx->encodeConfig.rcParams.vbvInitialDelay = nvencCtx->vbvInitialDelay;
     }
 
+    /* QP wiring. For CONSTQP: initial_qp (or per-picture qp when set later)
+     * becomes the fixed QP applied to all frame types. For CBR/VBR: min/max
+     * QP bound the encoder's adaptive QP range. Zero means "unset" — keep
+     * NVENC's default behavior. */
+    if (nvencCtx->encodeConfig.rcParams.rateControlMode == NV_ENC_PARAMS_RC_CONSTQP) {
+        uint32_t qp = nvencCtx->picQP > 0 ? nvencCtx->picQP :
+                      (nvencCtx->initialQP > 0 ? nvencCtx->initialQP : 0);
+        if (qp > 0) {
+            nvencCtx->encodeConfig.rcParams.constQP.qpInterP = qp;
+            nvencCtx->encodeConfig.rcParams.constQP.qpInterB = qp;
+            nvencCtx->encodeConfig.rcParams.constQP.qpIntra  = qp;
+        }
+    }
+    if (nvencCtx->minQP > 0) {
+        nvencCtx->encodeConfig.rcParams.enableMinQP = 1;
+        nvencCtx->encodeConfig.rcParams.minQP.qpInterP = nvencCtx->minQP;
+        nvencCtx->encodeConfig.rcParams.minQP.qpInterB = nvencCtx->minQP;
+        nvencCtx->encodeConfig.rcParams.minQP.qpIntra  = nvencCtx->minQP;
+    }
+    if (nvencCtx->maxQP > 0) {
+        nvencCtx->encodeConfig.rcParams.enableMaxQP = 1;
+        nvencCtx->encodeConfig.rcParams.maxQP.qpInterP = nvencCtx->maxQP;
+        nvencCtx->encodeConfig.rcParams.maxQP.qpInterB = nvencCtx->maxQP;
+        nvencCtx->encodeConfig.rcParams.maxQP.qpIntra  = nvencCtx->maxQP;
+    }
+    /* enableInitialRCQP for CBR/VBR seeding — NVENC accepts a per-frame-type
+     * initial QP hint distinct from constQP. */
+    if (nvencCtx->initialQP > 0 &&
+        nvencCtx->encodeConfig.rcParams.rateControlMode != NV_ENC_PARAMS_RC_CONSTQP) {
+        nvencCtx->encodeConfig.rcParams.enableInitialRCQP = 1;
+        nvencCtx->encodeConfig.rcParams.initialRCQP.qpInterP = nvencCtx->initialQP;
+        nvencCtx->encodeConfig.rcParams.initialRCQP.qpInterB = nvencCtx->initialQP;
+        nvencCtx->encodeConfig.rcParams.initialRCQP.qpIntra  = nvencCtx->initialQP;
+    }
+
     if (nvencCtx->intraPeriod > 0) {
         nvencCtx->encodeConfig.gopLength = nvencCtx->intraPeriod;
     } else {
@@ -261,6 +321,7 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
     nvencCtx->appliedMaxBitrate = nvencCtx->encodeConfig.rcParams.maxBitRate;
     nvencCtx->appliedFrameRateNum = nvencCtx->initParams.frameRateNum;
     nvencCtx->appliedFrameRateDen = nvencCtx->initParams.frameRateDen;
+    nvencCtx->appliedConstQP = nvencCtx->encodeConfig.rcParams.constQP.qpIntra;
     LOG("NVENC encoder initialized: %ux%u codec=%s",
         width, height,
         memcmp(&codecGuid, &NV_ENC_CODEC_H264_GUID, sizeof(GUID)) == 0 ? "H.264" :
@@ -286,7 +347,16 @@ bool nvenc_reconfigure_if_needed(NVENCContext *nvencCtx)
         reqFrameRateNum != nvencCtx->appliedFrameRateNum ||
         reqFrameRateDen != nvencCtx->appliedFrameRateDen;
 
-    if (!bitrateChanged && !maxBitrateChanged && !frameRateChanged) {
+    /* Per-picture QP override — only meaningful in CONSTQP mode; other modes
+     * use min/max/initial as bounds and NVENC picks per-frame QP itself. */
+    const bool constQPActive = nvencCtx->encodeConfig.rcParams.rateControlMode
+                                    == NV_ENC_PARAMS_RC_CONSTQP;
+    const uint32_t reqConstQP = nvencCtx->picQP > 0 ? nvencCtx->picQP :
+                                 (nvencCtx->initialQP > 0 ? nvencCtx->initialQP : 0);
+    const bool constQPChanged = constQPActive && reqConstQP > 0 &&
+                                 reqConstQP != nvencCtx->appliedConstQP;
+
+    if (!bitrateChanged && !maxBitrateChanged && !frameRateChanged && !constQPChanged) {
         return true;
     }
 
@@ -299,6 +369,11 @@ bool nvenc_reconfigure_if_needed(NVENCContext *nvencCtx)
     if (frameRateChanged) {
         nvencCtx->initParams.frameRateNum = reqFrameRateNum;
         nvencCtx->initParams.frameRateDen = reqFrameRateDen;
+    }
+    if (constQPChanged) {
+        nvencCtx->encodeConfig.rcParams.constQP.qpInterP = reqConstQP;
+        nvencCtx->encodeConfig.rcParams.constQP.qpInterB = reqConstQP;
+        nvencCtx->encodeConfig.rcParams.constQP.qpIntra  = reqConstQP;
     }
 
     NV_ENC_RECONFIGURE_PARAMS reconf = {0};
@@ -315,16 +390,18 @@ bool nvenc_reconfigure_if_needed(NVENCContext *nvencCtx)
         return false;
     }
 
-    LOG("NVENC: reconfigured bitrate=%u->%u max=%u->%u fps=%u/%u->%u/%u",
+    LOG("NVENC: reconfigured bitrate=%u->%u max=%u->%u fps=%u/%u->%u/%u constQP=%u->%u",
         nvencCtx->appliedBitrate, reqBitrate,
         nvencCtx->appliedMaxBitrate, reqMaxBitrate,
         nvencCtx->appliedFrameRateNum, nvencCtx->appliedFrameRateDen,
-        reqFrameRateNum, reqFrameRateDen);
+        reqFrameRateNum, reqFrameRateDen,
+        nvencCtx->appliedConstQP, constQPChanged ? reqConstQP : nvencCtx->appliedConstQP);
 
     nvencCtx->appliedBitrate = reqBitrate;
     nvencCtx->appliedMaxBitrate = reqMaxBitrate;
     nvencCtx->appliedFrameRateNum = reqFrameRateNum;
     nvencCtx->appliedFrameRateDen = reqFrameRateDen;
+    if (constQPChanged) nvencCtx->appliedConstQP = reqConstQP;
     return true;
 }
 
@@ -542,10 +619,60 @@ bool nvenc_is_encode_profile(VAProfile profile)
     case VAProfileH264ConstrainedBaseline:
     case VAProfileH264Main:
     case VAProfileH264High:
+    case VAProfileH264High10:
     case VAProfileHEVCMain:
     case VAProfileHEVCMain10:
+    case VAProfileHEVCMain422_10:
+    case VAProfileHEVCMain444:
+    case VAProfileHEVCMain444_10:
     case VAProfileAV1Profile0:
         return true;
+    default:
+        return false;
+    }
+}
+
+bool nvenc_is_encode_profile_supported(NVDriver *drv, VAProfile profile)
+{
+    if (!nvenc_is_encode_profile(profile)) return false;
+
+    /* No probe results yet (CUDA-less / IPC-only build, or probe hasn't
+     * run) — fall back to the fork's historical hardcoded list. This is
+     * the pre-caps behavior for the base six profiles. */
+    if (!drv->nvencCapsProbed) {
+        return profile == VAProfileH264ConstrainedBaseline ||
+               profile == VAProfileH264Main ||
+               profile == VAProfileH264High ||
+               profile == VAProfileHEVCMain ||
+               profile == VAProfileHEVCMain10 ||
+               profile == VAProfileAV1Profile0;
+    }
+
+    switch (profile) {
+    case VAProfileH264ConstrainedBaseline:
+    case VAProfileH264Main:
+    case VAProfileH264High:
+        return drv->nvencSupportsH264;
+    case VAProfileH264High10:
+        return drv->nvencSupportsH264 && drv->nvencSupportsH264High10;
+    case VAProfileHEVCMain:
+        return drv->nvencSupportsHEVC;
+    case VAProfileHEVCMain10:
+        return drv->nvencSupportsHEVC && drv->nvencSupportsHEVCMain10;
+    case VAProfileHEVCMain422_10:
+        /* NVENC advertises the FREXT umbrella profile and NV16 or P210
+         * input. Require both — a card that has FREXT but no P210 input
+         * can't accept 10-bit 4:2:2 pixels. */
+        return drv->nvencSupportsHEVC && drv->nvencSupportsHEVCFrext &&
+               drv->nvencSupportsInputYUV422_10;
+    case VAProfileHEVCMain444:
+        return drv->nvencSupportsHEVC && drv->nvencSupportsHEVCFrext &&
+               drv->nvencSupportsInputYUV444;
+    case VAProfileHEVCMain444_10:
+        return drv->nvencSupportsHEVC && drv->nvencSupportsHEVCFrext &&
+               drv->nvencSupportsInputYUV444_10;
+    case VAProfileAV1Profile0:
+        return drv->nvencSupportsAV1;
     default:
         return false;
     }
@@ -557,9 +684,13 @@ GUID nvenc_va_profile_to_codec_guid(VAProfile profile)
     case VAProfileH264ConstrainedBaseline:
     case VAProfileH264Main:
     case VAProfileH264High:
+    case VAProfileH264High10:
         return NV_ENC_CODEC_H264_GUID;
     case VAProfileHEVCMain:
     case VAProfileHEVCMain10:
+    case VAProfileHEVCMain422_10:
+    case VAProfileHEVCMain444:
+    case VAProfileHEVCMain444_10:
         return NV_ENC_CODEC_HEVC_GUID;
     case VAProfileAV1Profile0:
         return NV_ENC_CODEC_AV1_GUID;
@@ -579,10 +710,20 @@ GUID nvenc_va_profile_to_profile_guid(VAProfile profile)
         return NV_ENC_H264_PROFILE_MAIN_GUID;
     case VAProfileH264High:
         return NV_ENC_H264_PROFILE_HIGH_GUID;
+    case VAProfileH264High10:
+        return NV_ENC_H264_PROFILE_HIGH_10_GUID;
     case VAProfileHEVCMain:
         return NV_ENC_HEVC_PROFILE_MAIN_GUID;
     case VAProfileHEVCMain10:
         return NV_ENC_HEVC_PROFILE_MAIN10_GUID;
+    case VAProfileHEVCMain422_10:
+    case VAProfileHEVCMain444:
+    case VAProfileHEVCMain444_10:
+        /* NVENC exposes a single FREXT profile GUID for all HEVC range-
+         * extension flavors; the actual chroma/bit-depth combination is
+         * selected via NV_ENC_CONFIG_HEVC.{chromaFormatIDC, pixelBitDepth}
+         * and matched to the input buffer format. */
+        return NV_ENC_HEVC_PROFILE_FREXT_GUID;
     case VAProfileAV1Profile0:
         return NV_ENC_AV1_PROFILE_MAIN_GUID;
     default: {
@@ -592,10 +733,177 @@ GUID nvenc_va_profile_to_profile_guid(VAProfile profile)
     }
 }
 
+NvencChromaFormat nvenc_profile_chroma(VAProfile profile)
+{
+    switch (profile) {
+    case VAProfileHEVCMain422_10:
+        return NVENC_CHROMA_422;
+    case VAProfileHEVCMain444:
+    case VAProfileHEVCMain444_10:
+        return NVENC_CHROMA_444;
+    default:
+        return NVENC_CHROMA_420;
+    }
+}
+
 NV_ENC_BUFFER_FORMAT nvenc_surface_format(VAProfile profile, int bitDepth)
 {
+    switch (profile) {
+    case VAProfileHEVCMain422_10:
+        return NV_ENC_BUFFER_FORMAT_P210;
+    case VAProfileHEVCMain444:
+        return NV_ENC_BUFFER_FORMAT_YUV444;
+    case VAProfileHEVCMain444_10:
+        return NV_ENC_BUFFER_FORMAT_YUV444_10BIT;
+    case VAProfileH264High10:
+        return NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
+    default:
+        break;
+    }
     if (bitDepth == 10) {
         return NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
     }
     return NV_ENC_BUFFER_FORMAT_NV12;
+}
+
+/* ---------------- Capability probe ----------------
+ *
+ * Opens a scratch NVENC session on drv->cudaContext, walks the encoder's
+ * exported GUIDs / profile GUIDs / input format list / per-codec caps,
+ * and records the results on drv. Called once, lazily, on the first
+ * config-side encode query — cost is one session-open+destroy per driver
+ * instance. */
+
+static bool guid_eq(const GUID *a, const GUID *b) {
+    return memcmp(a, b, sizeof(GUID)) == 0;
+}
+
+static bool nvenc_query_cap(NV_ENCODE_API_FUNCTION_LIST *funcs,
+                             void *encoder, GUID codecGuid,
+                             NV_ENC_CAPS capsToQuery, int *out) {
+    NV_ENC_CAPS_PARAM param = { .version = NV_ENC_CAPS_PARAM_VER,
+                                 .capsToQuery = capsToQuery };
+    return funcs->nvEncGetEncodeCaps(encoder, codecGuid, &param, out) == NV_ENC_SUCCESS;
+}
+
+bool nvenc_probe_caps(NVDriver *drv)
+{
+    if (drv->nvencCapsProbed) return true;
+    if (!drv->cudaAvailable || drv->cudaContext == NULL) {
+        LOG("NVENC caps probe skipped: no CUDA context (IPC-only build?)");
+        drv->nvencCapsProbed = true;  /* don't retry */
+        return false;
+    }
+    if (drv->nv == NULL) {
+        LOG("NVENC caps probe skipped: nvenc library not loaded");
+        drv->nvencCapsProbed = true;
+        return false;
+    }
+
+    NVENCContext tmp = {0};
+    if (!nvenc_open_session(&tmp, drv->nv, drv->cudaContext)) {
+        LOG("NVENC caps probe: could not open scratch session");
+        drv->nvencCapsProbed = true;
+        return false;
+    }
+
+    /* 1. Codec GUIDs the driver supports at all. */
+    uint32_t codecCount = 0;
+    if (tmp.funcs.nvEncGetEncodeGUIDCount(tmp.encoder, &codecCount) != NV_ENC_SUCCESS ||
+        codecCount == 0) {
+        LOG("NVENC caps probe: no codec GUIDs advertised");
+        goto done;
+    }
+    GUID *codecs = calloc(codecCount, sizeof(GUID));
+    if (!codecs) goto done;
+    uint32_t codecFilled = 0;
+    tmp.funcs.nvEncGetEncodeGUIDs(tmp.encoder, codecs, codecCount, &codecFilled);
+    for (uint32_t i = 0; i < codecFilled; i++) {
+        if      (guid_eq(&codecs[i], &NV_ENC_CODEC_H264_GUID)) drv->nvencSupportsH264 = true;
+        else if (guid_eq(&codecs[i], &NV_ENC_CODEC_HEVC_GUID)) drv->nvencSupportsHEVC = true;
+        else if (guid_eq(&codecs[i], &NV_ENC_CODEC_AV1_GUID))  drv->nvencSupportsAV1  = true;
+    }
+
+    /* 2. For each supported codec, walk the profile GUIDs it advertises.
+     * We only care about the ones that gate new fork surface: H264 High10
+     * (via NV_ENC_H264_PROFILE_HIGH_10_GUID) and HEVC FREXT (umbrella for
+     * Main422_10 / Main444 / Main444_10 via NV_ENC_HEVC_PROFILE_FREXT_GUID). */
+    GUID interested[] = {
+        NV_ENC_H264_PROFILE_HIGH_10_GUID,
+        NV_ENC_HEVC_PROFILE_MAIN10_GUID,
+        NV_ENC_HEVC_PROFILE_FREXT_GUID,
+    };
+    for (uint32_t i = 0; i < codecFilled; i++) {
+        uint32_t profCount = 0;
+        if (tmp.funcs.nvEncGetEncodeProfileGUIDCount(tmp.encoder, codecs[i],
+                                                     &profCount) != NV_ENC_SUCCESS)
+            continue;
+        if (profCount == 0) continue;
+        GUID *profs = calloc(profCount, sizeof(GUID));
+        if (!profs) continue;
+        uint32_t profFilled = 0;
+        tmp.funcs.nvEncGetEncodeProfileGUIDs(tmp.encoder, codecs[i], profs,
+                                              profCount, &profFilled);
+        for (uint32_t j = 0; j < profFilled; j++) {
+            for (size_t k = 0; k < sizeof(interested)/sizeof(interested[0]); k++) {
+                if (!guid_eq(&profs[j], &interested[k])) continue;
+                if (guid_eq(&interested[k], &NV_ENC_H264_PROFILE_HIGH_10_GUID))
+                    drv->nvencSupportsH264High10 = true;
+                else if (guid_eq(&interested[k], &NV_ENC_HEVC_PROFILE_MAIN10_GUID))
+                    drv->nvencSupportsHEVCMain10 = true;
+                else if (guid_eq(&interested[k], &NV_ENC_HEVC_PROFILE_FREXT_GUID))
+                    drv->nvencSupportsHEVCFrext = true;
+            }
+        }
+        free(profs);
+    }
+
+    /* 3. Per-codec caps for 10-bit / YUV444 / YUV422 encode. */
+    if (drv->nvencSupportsAV1) {
+        int cap = 0;
+        if (nvenc_query_cap(&tmp.funcs, tmp.encoder, NV_ENC_CODEC_AV1_GUID,
+                            NV_ENC_CAPS_SUPPORT_10BIT_ENCODE, &cap))
+            drv->nvencSupportsAV1_10bit = (cap != 0);
+    }
+
+    /* 4. Input formats — walk supported formats for each active codec to
+     * populate the YUV444 / YUV444_10 / YUV422 / YUV422_10 flags. Format
+     * support is codec-agnostic in NVENC's API but the cap query is per-
+     * codec, so we OR across the codecs we care about. */
+    for (uint32_t i = 0; i < codecFilled; i++) {
+        uint32_t fmtCount = 0;
+        if (tmp.funcs.nvEncGetInputFormatCount(tmp.encoder, codecs[i],
+                                                &fmtCount) != NV_ENC_SUCCESS ||
+            fmtCount == 0) continue;
+        NV_ENC_BUFFER_FORMAT *fmts = calloc(fmtCount, sizeof(NV_ENC_BUFFER_FORMAT));
+        if (!fmts) continue;
+        uint32_t fmtFilled = 0;
+        tmp.funcs.nvEncGetInputFormats(tmp.encoder, codecs[i], fmts, fmtCount,
+                                        &fmtFilled);
+        for (uint32_t j = 0; j < fmtFilled; j++) {
+            switch (fmts[j]) {
+            case NV_ENC_BUFFER_FORMAT_YUV444:        drv->nvencSupportsInputYUV444    = true; break;
+            case NV_ENC_BUFFER_FORMAT_YUV444_10BIT:  drv->nvencSupportsInputYUV444_10 = true; break;
+            case NV_ENC_BUFFER_FORMAT_NV16:          drv->nvencSupportsInputYUV422    = true; break;
+            case NV_ENC_BUFFER_FORMAT_P210:          drv->nvencSupportsInputYUV422_10 = true; break;
+            default: break;
+            }
+        }
+        free(fmts);
+    }
+    free(codecs);
+
+    LOG("NVENC caps: H264=%d(High10=%d) HEVC=%d(Main10=%d, FREXT=%d) "
+        "AV1=%d(10bit=%d) input{YUV444=%d YUV444_10=%d YUV422=%d YUV422_10=%d}",
+        drv->nvencSupportsH264, drv->nvencSupportsH264High10,
+        drv->nvencSupportsHEVC, drv->nvencSupportsHEVCMain10,
+        drv->nvencSupportsHEVCFrext,
+        drv->nvencSupportsAV1, drv->nvencSupportsAV1_10bit,
+        drv->nvencSupportsInputYUV444, drv->nvencSupportsInputYUV444_10,
+        drv->nvencSupportsInputYUV422, drv->nvencSupportsInputYUV422_10);
+
+done:
+    nvenc_close_session(&tmp);
+    drv->nvencCapsProbed = true;
+    return true;
 }

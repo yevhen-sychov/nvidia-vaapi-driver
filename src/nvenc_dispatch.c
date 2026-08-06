@@ -31,9 +31,26 @@ void nvGetConfigAttributesEncode(
     {
         switch (attrib_list[i].type) {
         case VAConfigAttribRTFormat:
-            attrib_list[i].value = VA_RT_FORMAT_YUV420;
-            if (profile == VAProfileHEVCMain10 || profile == VAProfileAV1Profile0) {
-                attrib_list[i].value |= VA_RT_FORMAT_YUV420_10;
+            switch (profile) {
+            case VAProfileH264High10:
+                attrib_list[i].value = VA_RT_FORMAT_YUV420_10;
+                break;
+            case VAProfileHEVCMain422_10:
+                attrib_list[i].value = VA_RT_FORMAT_YUV422_10;
+                break;
+            case VAProfileHEVCMain444:
+                attrib_list[i].value = VA_RT_FORMAT_YUV444;
+                break;
+            case VAProfileHEVCMain444_10:
+                attrib_list[i].value = VA_RT_FORMAT_YUV444_10;
+                break;
+            case VAProfileHEVCMain10:
+            case VAProfileAV1Profile0:
+                attrib_list[i].value = VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10;
+                break;
+            default:
+                attrib_list[i].value = VA_RT_FORMAT_YUV420;
+                break;
             }
             break;
         case VAConfigAttribRateControl:
@@ -84,7 +101,9 @@ void nvGetConfigAttributesEncode(
             attrib_list[i].value = 7; //NVENC presets P1-P7
             break;
         case VAConfigAttribEncHEVCFeatures:
-            if (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10) {
+            if (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10 ||
+                profile == VAProfileHEVCMain422_10 ||
+                profile == VAProfileHEVCMain444 || profile == VAProfileHEVCMain444_10) {
                 VAConfigAttribValEncHEVCFeatures v = { .value = 0 };
                 v.bits.amp = VA_FEATURE_SUPPORTED;
                 v.bits.sao = VA_FEATURE_SUPPORTED;
@@ -101,7 +120,9 @@ void nvGetConfigAttributesEncode(
             }
             break;
         case VAConfigAttribEncHEVCBlockSizes:
-            if (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10) {
+            if (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10 ||
+                profile == VAProfileHEVCMain422_10 ||
+                profile == VAProfileHEVCMain444 || profile == VAProfileHEVCMain444_10) {
                 VAConfigAttribValEncHEVCBlockSizes v = { .value = 0 };
                 v.bits.log2_max_coding_tree_block_size_minus3 = 3; // 64x64
                 v.bits.log2_min_coding_tree_block_size_minus3 = 0; // 8x8
@@ -177,9 +198,13 @@ void nvRenderPictureEncode(NVContext *nvCtx, NVBuffer *buf)
     NVENCContext *nvencCtx = (NVENCContext*) nvCtx->encodeData;
     bool isH264 = (nvCtx->profile == VAProfileH264ConstrainedBaseline ||
                    nvCtx->profile == VAProfileH264Main ||
-                   nvCtx->profile == VAProfileH264High);
+                   nvCtx->profile == VAProfileH264High ||
+                   nvCtx->profile == VAProfileH264High10);
     bool isHEVC = (nvCtx->profile == VAProfileHEVCMain ||
-                   nvCtx->profile == VAProfileHEVCMain10);
+                   nvCtx->profile == VAProfileHEVCMain10 ||
+                   nvCtx->profile == VAProfileHEVCMain422_10 ||
+                   nvCtx->profile == VAProfileHEVCMain444 ||
+                   nvCtx->profile == VAProfileHEVCMain444_10);
     bool isAV1 = (nvCtx->profile == VAProfileAV1Profile0);
 
     switch (buf->bufferType) {
@@ -836,7 +861,12 @@ VAStatus nvenc_dispatch_create_config(NVDriver *drv, VAProfile profile,
                                       int num_attribs,
                                       VAConfigID *config_id_out)
 {
-    if (!drv->nvencAvailable || !nvenc_is_encode_profile(profile)) {
+    /* Lazy one-shot capability probe so the whitelist check below can gate
+     * higher-profile advertisement (H.264 High10, HEVC FREXT variants,
+     * YUV444/YUV422) by what the card really supports instead of a static
+     * hardcoded list. */
+    nvenc_probe_caps(drv);
+    if (!drv->nvencAvailable || !nvenc_is_encode_profile_supported(drv, profile)) {
         LOG("Encode not supported for profile: %d", profile);
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
@@ -861,9 +891,32 @@ VAStatus nvenc_dispatch_create_config(NVDriver *drv, VAProfile profile,
         cfg->allowBframes = false;
     }
 
-    if (profile == VAProfileHEVCMain10) {
+    /* Profile-level defaults for chroma format and bit depth. Individual
+     * VAConfigAttribRTFormat entries below can refine (e.g. HEVCMain10 +
+     * client asks for pure 10-bit vs "either"). */
+    switch (profile) {
+    case VAProfileHEVCMain10:
+    case VAProfileH264High10:
         cfg->bitDepth = 10;
         cfg->surfaceFormat = cudaVideoSurfaceFormat_P016;
+        break;
+    case VAProfileHEVCMain422_10:
+        cfg->bitDepth = 10;
+        cfg->chromaFormat = cudaVideoChromaFormat_422;
+        cfg->surfaceFormat = cudaVideoSurfaceFormat_P016;
+        break;
+    case VAProfileHEVCMain444:
+        cfg->bitDepth = 8;
+        cfg->chromaFormat = cudaVideoChromaFormat_444;
+        cfg->surfaceFormat = cudaVideoSurfaceFormat_YUV444;
+        break;
+    case VAProfileHEVCMain444_10:
+        cfg->bitDepth = 10;
+        cfg->chromaFormat = cudaVideoChromaFormat_444;
+        cfg->surfaceFormat = cudaVideoSurfaceFormat_YUV444_16Bit;
+        break;
+    default:
+        break;
     }
 
     for (int i = 0; i < num_attribs; i++) {
@@ -898,9 +951,27 @@ VAStatus nvenc_dispatch_query_config_attributes(NVConfig *cfg,
 {
     int i = 0;
     attrib_list[i].type = VAConfigAttribRTFormat;
-    attrib_list[i].value = VA_RT_FORMAT_YUV420;
-    if (cfg->profile == VAProfileHEVCMain10 || cfg->profile == VAProfileAV1Profile0) {
-        attrib_list[i].value |= VA_RT_FORMAT_YUV420_10;
+    attrib_list[i].value = 0;
+    switch (cfg->profile) {
+    case VAProfileH264High10:
+        attrib_list[i].value = VA_RT_FORMAT_YUV420_10;
+        break;
+    case VAProfileHEVCMain422_10:
+        attrib_list[i].value = VA_RT_FORMAT_YUV422_10;
+        break;
+    case VAProfileHEVCMain444:
+        attrib_list[i].value = VA_RT_FORMAT_YUV444;
+        break;
+    case VAProfileHEVCMain444_10:
+        attrib_list[i].value = VA_RT_FORMAT_YUV444_10;
+        break;
+    case VAProfileHEVCMain10:
+    case VAProfileAV1Profile0:
+        attrib_list[i].value = VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10;
+        break;
+    default:
+        attrib_list[i].value = VA_RT_FORMAT_YUV420;
+        break;
     }
     i++;
     *num_attribs = i;

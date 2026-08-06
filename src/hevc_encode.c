@@ -49,6 +49,12 @@ void hevcenc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     if (nvencCtx->forceIDR) {
         LOG("HEVC encode: picture params, coded_buf=%d, IDR requested", pic->coded_buf);
     }
+    /* Per-picture CQP hint. VA-API HEVC's pic_init_qp is the resolved QP
+     * (init_qp_minus26 + 26). In CONSTQP mode nvenc_reconfigure_if_needed
+     * picks this up before the next encode. */
+    if (pic->pic_init_qp > 0 && pic->pic_init_qp <= 51) {
+        nvencCtx->picQP = pic->pic_init_qp;
+    }
 }
 
 void hevcenc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)
@@ -83,7 +89,8 @@ void hevcenc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     case VAEncMiscParameterTypeRateControl: {
         VAEncMiscParameterRateControl *rc =
             (VAEncMiscParameterRateControl*) misc->data;
-        LOG("HEVC encode: rate control bits_per_second=%u", rc->bits_per_second);
+        LOG("HEVC encode: rate control bits_per_second=%u qp{init=%u min=%u max=%u}",
+            rc->bits_per_second, rc->initial_qp, rc->min_qp, rc->max_qp);
         if (rc->bits_per_second > 0) {
             nvencCtx->maxBitrate = rc->bits_per_second;
             if (rc->target_percentage > 0) {
@@ -92,6 +99,9 @@ void hevcenc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
                 nvencCtx->bitrate = rc->bits_per_second;
             }
         }
+        if (rc->initial_qp > 0) nvencCtx->initialQP = rc->initial_qp;
+        if (rc->min_qp > 0)     nvencCtx->minQP     = rc->min_qp;
+        if (rc->max_qp > 0)     nvencCtx->maxQP     = rc->max_qp;
         break;
     }
     case VAEncMiscParameterTypeFrameRate: {

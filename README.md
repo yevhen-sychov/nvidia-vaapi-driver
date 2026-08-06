@@ -70,14 +70,48 @@ To view which codecs your card is capable of decoding you can use the `vainfo` c
 
 Hardware encoding is exposed through the VA-API `VAEntrypointEncSlice` entrypoint and is backed by NVENC. It becomes available when a usable NVENC engine is detected (either directly or via the [NVENC encode helper](#nvenc-encode-helper)).
 
+Encode entrypoints are **capability-gated at runtime** via NVENC GUID / profile
+/ input-format / caps probes at driver init — the profile list below is
+the fork's implementation ceiling; the actual set exposed to `vainfo`
+depends on what your card admits. `NVD_LOG=1` shows an `NVENC caps: ...`
+line at driver init with the probe result.
+
 | Codec | Supported | Profiles | Comments |
 |---|---|---|---|
-|H.264|:heavy_check_mark:|Constrained Baseline, Main, High||
-|HEVC|:heavy_check_mark:|Main, Main10|Main10 enables 10-bit encoding.|
-|AV1|:heavy_check_mark:|Profile0|Requires an NVENC engine with AV1 encode support (Ada/Lovelace 40XX or newer).|
-|VP8 / VP9|:x:||Not supported by NVENC.|
+|H.264|:heavy_check_mark:|Constrained Baseline, Main, High, High10|High10 requires 10-bit encode capability + `NV_ENC_H264_PROFILE_HIGH_10_GUID` (probed).|
+|HEVC|:heavy_check_mark:|Main, Main10, Main422_10, Main444, Main444_10|Main422_10 / Main444 / Main444_10 all live behind the FREXT profile GUID + the corresponding NVENC input format (P210 / YUV444 / YUV444_10BIT); each is gated independently.|
+|AV1|:heavy_check_mark:|Profile0|10-bit 4:2:0 input exposed when NVENC advertises `SUPPORT_10BIT_ENCODE`. Requires an NVENC engine with AV1 encode support (Ada/Lovelace 40XX or newer).|
+|VP8 / VP9 / MPEG-2 / VC-1 / MPEG-4 / JPEG / MJPEG|:x:||Not implemented — NVENC's public API does not expose these encode profiles.|
+|HEVC Main12 / Main444_12|:x:||Decode-only. NVENC public API does not expose 12-bit HEVC encode.|
 
-Actual encode capabilities depend on your GPU's NVENC generation. To view which codecs your card is capable of encoding you can use the `vainfo` command with this driver installed, or visit the NVIDIA [encode/decode support matrix](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new#geforce).
+Actual encode capabilities depend on your GPU's NVENC generation. `vainfo` is the source of truth.
+
+### Rate control
+
+Modes: CQP, CBR, VBR. `VAEncMiscParameterRateControl` parses
+`bits_per_second`, `target_percentage`, `initial_qp`, `min_qp`, `max_qp`.
+`initial_qp` seeds `NV_ENC_CONFIG.rcParams.initialRCQP` (CBR/VBR) or
+`constQP` (CONSTQP); `min_qp` / `max_qp` set NVENC's adaptive-QP bounds
+via `enableMinQP` / `enableMaxQP`. For CONSTQP, `VAEncPictureParameterBuffer`'s
+`pic_init_qp` (H.264) and equivalent (HEVC) can override QP per picture —
+picked up by `nvenc_reconfigure_if_needed` before the next frame.
+
+The client-side format-negotiation caveat still applies: some ffmpeg paths
+may renegotiate HEVC rext + `yuv444p10le` down to `yuv420p10le` before
+frames reach the driver — verify the effective output with `ffprobe`.
+
+### Format-plumbing status for the newer profiles
+
+**Config advertisement and NVENC init** for H.264 High10, HEVC Main422_10 /
+Main444 / Main444_10 are wired end-to-end (probe → advertise correct
+`RTFormat` → allocate config → configure NVENC with the right
+`chromaFormatIDC` + `pixelBitDepth`). **Actual encode data-path** for YUV444
+and YUV422 surfaces reuses the existing NV12/P010 plumbing where the CUDA
+copy assumes 4:2:0 subsampled chroma; running these profiles end-to-end
+with real YUV444/422 pixel data may need additional CUDA copy tuning for
+the correct chroma plane layout. Intended for transcoding-style workloads
+where the source is already in the target chroma format — a full data-path
+audit is not done. If you hit issues, please file with an NVD_LOG=1 trace.
 
 ### Live rate-control / framerate updates (WebRTC BWE)
 
@@ -487,9 +521,23 @@ efortin PR #427 base and elFarto's upstream master. See
 `git log --oneline main..HEAD` for the exhaustive list.
 
 - **NVENC encode entrypoint** — full VA-API `VAEntrypointEncSlice` for H.264
-  (Constrained Baseline / Main / High), HEVC (Main, Main10) and AV1 (Profile0).
-  Exposed via `VAConfigAttribRateControl`, packed headers, quality level, ref
-  frames, max dimensions, and (AV1) temporal SVC.
+  (Constrained Baseline / Main / High / **High10**), HEVC (Main, Main10,
+  **Main422_10**, **Main444**, **Main444_10**) and AV1 (Profile0). Exposed
+  via `VAConfigAttribRateControl`, packed headers, quality level, ref
+  frames, max dimensions, and (AV1) temporal SVC. Profile advertisement is
+  **runtime capability-gated** via NVENC `nvEncGetEncodeGUIDs` /
+  `nvEncGetEncodeProfileGUIDs` / `nvEncGetInputFormats` — a probed
+  `NVENC caps:` line lands in `NVD_LOG=1` at driver init showing the
+  actual bitset. High-tier profiles land only when the card exposes both
+  the profile GUID and the matching input format (P210 for 422_10,
+  YUV444/YUV444_10BIT for the 444 variants, H264 High10 GUID for High10).
+- **Rate-control QP hints** — `VAEncMiscParameterRateControl` now parses
+  `initial_qp` / `min_qp` / `max_qp` and programs them into NVENC
+  (`constQP` for CONSTQP mode, `initialRCQP` for CBR/VBR, `enableMinQP` /
+  `enableMaxQP` bounds always). Per-picture `pic_init_qp` in
+  `VAEncPictureParameterBufferH264`/`HEVC` is picked up too — in CONSTQP
+  mode `nvenc_reconfigure_if_needed` rewrites `constQP` before the next
+  encode when the requested QP moves.
 - **NVENC out-of-process helper** — `nvenc-helper.service` (user systemd unit)
   + `/usr/libexec/nvenc-helper` binary + IPC channel for sandboxed browser
   processes that can't init CUDA/NVENC directly. Rebuild + restart with

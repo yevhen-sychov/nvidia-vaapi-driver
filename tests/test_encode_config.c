@@ -206,6 +206,118 @@ static void test_config_quality_range(void) {
     TEST_PASS();
 }
 
+/* --- Capability-dependent profile tests --- */
+
+/* Attempt vaCreateConfig for a "high-tier" profile. If the driver reports
+ * unsupported (VA_STATUS_ERROR_UNSUPPORTED_PROFILE) that's an honest SKIP:
+ * the runtime capability probe determined this NVENC/NVDEC combination
+ * does not accept it. If it returns SUCCESS, confirm the advertised
+ * VAConfigAttribRTFormat mask matches the expected chroma layout for the
+ * profile — otherwise the config is misadvertised and clients will fail
+ * at surface-alloc time. */
+static void test_capability_gated_profile(VAProfile profile, const char *name,
+                                           uint32_t expected_rtformat) {
+    char label[64];
+    snprintf(label, sizeof(label), "cap-gated encode: %-14s", name);
+    TEST_START(label);
+
+    VAConfigAttrib attr = { .type = VAConfigAttribRTFormat, .value = expected_rtformat };
+    VAConfigID config;
+    VAStatus st = vaCreateConfig(g_dpy, profile, VAEntrypointEncSlice,
+                                  &attr, 1, &config);
+    if (st == VA_STATUS_ERROR_UNSUPPORTED_PROFILE ||
+        st == VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT ||
+        st == VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT) {
+        TEST_SKIP("gated off by NVENC caps on this hardware");
+        return;
+    }
+    if (st != VA_STATUS_SUCCESS) {
+        char msg[64]; snprintf(msg, sizeof(msg), "vaCreateConfig=%d", st);
+        TEST_FAIL(msg);
+        return;
+    }
+    /* Now check the RTFormat we advertise back matches what encode needs. */
+    VAConfigAttrib rt = { .type = VAConfigAttribRTFormat };
+    EXPECT_STATUS(vaGetConfigAttributes(g_dpy, profile, VAEntrypointEncSlice,
+                                         &rt, 1));
+    if ((rt.value & expected_rtformat) == 0) {
+        vaDestroyConfig(g_dpy, config);
+        TEST_FAIL("advertised RTFormat missing expected chroma");
+        return;
+    }
+    vaDestroyConfig(g_dpy, config);
+    TEST_PASS();
+}
+
+static void test_high_tier_profiles(void) {
+    test_capability_gated_profile(VAProfileH264High10, "H264 High10",
+                                   VA_RT_FORMAT_YUV420_10);
+    test_capability_gated_profile(VAProfileHEVCMain422_10, "HEVC 422_10",
+                                   VA_RT_FORMAT_YUV422_10);
+    test_capability_gated_profile(VAProfileHEVCMain444, "HEVC Main444",
+                                   VA_RT_FORMAT_YUV444);
+    test_capability_gated_profile(VAProfileHEVCMain444_10, "HEVC 444_10",
+                                   VA_RT_FORMAT_YUV444_10);
+}
+
+/* --- QP handling smoke test ---
+ *
+ * These do NOT validate the actual encoded QP in the bitstream (that would
+ * require decoding the H.264 stream back and inspecting slice headers,
+ * which is well beyond a smoke test). Instead they exercise the code paths
+ * that parse initial_qp / min_qp / max_qp and pic_init_qp — a misaligned
+ * struct or bad field name will make the test crash or fail to encode. */
+static void test_qp_misc_param_parses(void) {
+    TEST_START("Encode with initial_qp/min_qp/max_qp in CBR misc-param");
+    VAConfigAttrib attr[2] = {
+        { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 },
+        { .type = VAConfigAttribRateControl, .value = VA_RC_CBR },
+    };
+    VAConfigID cfg;
+    EXPECT_STATUS(vaCreateConfig(g_dpy, VAProfileH264High, VAEntrypointEncSlice,
+                                  attr, 2, &cfg));
+    VASurfaceID surf;
+    EXPECT_STATUS(vaCreateSurfaces(g_dpy, VA_RT_FORMAT_YUV420, 320, 240,
+                                    &surf, 1, NULL, 0));
+    VAContextID ctx;
+    EXPECT_STATUS(vaCreateContext(g_dpy, cfg, 320, 240, VA_PROGRESSIVE,
+                                    &surf, 1, &ctx));
+
+    /* Build a misc rate-control param populated with QP bounds. */
+    VAEncMiscParameterBuffer *misc_hdr = NULL;
+    VABufferID misc_buf;
+    EXPECT_STATUS(vaCreateBuffer(g_dpy, ctx, VAEncMiscParameterBufferType,
+                                  sizeof(VAEncMiscParameterBuffer) +
+                                    sizeof(VAEncMiscParameterRateControl),
+                                  1, NULL, &misc_buf));
+    EXPECT_STATUS(vaMapBuffer(g_dpy, misc_buf, (void**)&misc_hdr));
+    misc_hdr->type = VAEncMiscParameterTypeRateControl;
+    VAEncMiscParameterRateControl *rc =
+        (VAEncMiscParameterRateControl*)misc_hdr->data;
+    memset(rc, 0, sizeof(*rc));
+    rc->bits_per_second = 2000000;
+    rc->target_percentage = 90;
+    rc->initial_qp = 24;
+    rc->min_qp = 20;
+    rc->max_qp = 40;
+    EXPECT_STATUS(vaUnmapBuffer(g_dpy, misc_buf));
+
+    /* Send it in a Begin/Render/End cycle just to exercise the parser;
+     * skip the actual encode-picture cycle (needs full seq/pic/slice
+     * setup) since we only care that the misc-param path doesn't die. */
+    EXPECT_STATUS(vaBeginPicture(g_dpy, ctx, surf));
+    EXPECT_STATUS(vaRenderPicture(g_dpy, ctx, &misc_buf, 1));
+    /* Deliberately DON'T call vaEndPicture — that would trigger the real
+     * encode and require seq/pic/slice params. The parse happens inside
+     * vaRenderPicture handlers. */
+
+    vaDestroyBuffer(g_dpy, misc_buf);
+    vaDestroyContext(g_dpy, ctx);
+    vaDestroySurfaces(g_dpy, &surf, 1);
+    vaDestroyConfig(g_dpy, cfg);
+    TEST_PASS();
+}
+
 /* --- Error path tests --- */
 
 static void test_invalid_entrypoint(void) {
@@ -401,6 +513,12 @@ int main(void)
     printf("\nSurface export:\n");
     test_export_surface_descriptor();
     test_export_surface_descriptor_p010();
+
+    printf("\nHigh-tier profile capability gating:\n");
+    test_high_tier_profiles();
+
+    printf("\nQP handling:\n");
+    test_qp_misc_param_parses();
 
     test_print_summary("Config tests");
     test_global_teardown();
