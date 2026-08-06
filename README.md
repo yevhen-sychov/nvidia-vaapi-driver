@@ -19,6 +19,13 @@ including the Steam Remote Play integration path. Everything below labelled as
 - [Codec Support](#codec-support)
   - [Decode Support](#decode-support)
   - [Encode Support](#encode-support)
+    - [Rate control](#rate-control)
+    - [Format-plumbing status for the newer profiles](#format-plumbing-status-for-the-newer-profiles)
+    - [Live rate-control / framerate updates (WebRTC BWE)](#live-rate-control--framerate-updates-webrtc-bwe)
+    - [Long-running session stability](#long-running-session-stability)
+    - [AV1 VUI defaults (WebRTC-tuned)](#av1-vui-defaults-webrtc-tuned)
+    - [Client-driven IDR (no NVENC auto-refresh)](#client-driven-idr-no-nvenc-auto-refresh)
+    - [Known limitations](#known-limitations)
 - [Installation](#installation)
   - [Quick install from this fork](#quick-install-from-this-fork)
   - [Packaging status](#packaging-status)
@@ -136,6 +143,53 @@ registering/unregistering NVENC resources every frame was found to gradually
 destabilize long-running encode sessions (hard crash after a few minutes on
 sustained WebRTC calls). Regression is guarded by
 `test_long_running_single_session` in `tests/test_encode.c`.
+
+### AV1 VUI defaults (WebRTC-tuned)
+
+For AV1 encode we explicitly pin `NV_ENC_CONFIG_AV1.chromaFormatIDC = 1`
+(4:2:0; NVENC's bit-packed default of 0 produces mis-parsed chroma at the
+receive side) and set `colorRange = pc`, `colorPrimaries = BT.709`,
+`transferCharacteristics = BT.709`, `matrixCoefficients = BT.709`. These
+match Chrome / WebRTC's default capture pipeline (full-range BT.709 YUV
+from `getUserMedia` and `getDisplayMedia`), so a same-tab loopback decodes
+with consistent hue/gamma. Verified end-to-end with an external `libdav1d`
+decode of a real Chrome loopback capture — every frame renders as the
+original content, no chroma corruption.
+
+### Client-driven IDR (no NVENC auto-refresh)
+
+`NV_ENC_CONFIG.gopLength = NVENC_INFINITE_GOPLENGTH` for all three codecs.
+The client (ffmpeg, Chrome, Steam) already drives IDR insertion via
+`VAEncPictureParameterBuffer.idr_pic_flag`, which nvenc_dispatch translates
+to `NV_ENC_PIC_FLAG_FORCEIDR`. Letting NVENC also emit its own IDR every
+`intraPeriod` frames created a race between two IDR schedulers that
+produced conflicting RPS state at GOP boundaries — encoded streams
+referencing POCs the decoder had already evicted. Client-only IDR is the
+canonical shape for WebRTC anyway (BWE and packet-loss recovery request
+keyframes explicitly).
+
+### Known limitations
+
+- **HEVC cross-GOP RPS on high-detail content.** `hevc_vaapi` on
+  content with fine detail and motion decodes with
+  `Could not find ref with POC X / Error constructing frame RPS`
+  starting at the second GOP boundary. Single-GOP encodes score ~59 dB
+  PSNR (perfect); multi-GOP high-detail scores ~27 dB with visible
+  corruption. Config overrides tried (`repeatSPSPPS=1`,
+  `idrPeriod=infinite`, `maxNumRefFramesInDPB=4`, `gopLength=infinite`,
+  POC-reset-on-IDR) all produced bit-identical output — NVENC's preset
+  config is authoritative for these fields on the low-latency P4 preset
+  we currently use. Root cause deferred; regression is pinned by the
+  `hevc_vaapi` case in `tests/test_encode_roundtrip.sh` so a future fix
+  is verifiable. Workaround: use H.264 or AV1 for the affected paths;
+  smpte-bars-shaped content (large flat regions) remains fine on HEVC.
+- **YUV444 / YUV422 encode data path.** Config advertisement and NVENC
+  init are wired end-to-end for the H.264 High10 / HEVC Main422_10 /
+  Main444 / Main444_10 profiles (see [Format-plumbing status](#format-plumbing-status-for-the-newer-profiles)),
+  but the shared CUDA input-copy path was written for NV12/P010 4:2:0
+  and hasn't been audited for correct chroma-plane addressing on 4:2:2
+  and 4:4:4 sources. Intended for transcoding-style workloads where
+  the source is already in the target chroma format.
 
 # Installation
 
@@ -431,7 +485,9 @@ Individual harnesses:
 | `test_encode` | Encode entrypoints, config attributes, single-frame encode for H.264 / HEVC / HEVC Main10 / AV1 / AV1 Main10, rate control + quality-level params, AV1 temporal SVC and combined-RTFormat encode, dynamic resolution, sequential encodes, coded-buffer reuse, long-running single session, live bitrate/framerate reconfigure, auto-combined encode export, decode-still-works co-existence, dimension-mismatch, H.264 B-frames. |
 | `test_encode_config` | Config-side coverage: entrypoints, RTFormat, rate control, packed headers, ref frames, max dimensions, quality range, surface allocation (NV12 / P010 / small / 4K), export descriptor. |
 | `test_ipc_fuzz` | Fuzz surface for the NVENC out-of-process IPC helper (invalid commands, truncated inits, oversized payloads, rapid connect/disconnect, double-init, encode-without-init). |
+| `test_concurrent_sessions` | Multi-session stress covering the WebRTC "camera + screenshare" flow: two H.264 encoders in parallel at the same resolution, staggered encoder-B-added-mid-stream (mimics `getDisplayMedia` while camera is live), encoder+decoder co-existence at the same resolution, secondary-encoder create/destroy churn, and a descriptor-shape stability probe that asserts a decode surface exports a bit-identical `VADRMPRIMESurfaceDescriptor` whether captured cold or during a concurrent live encoder (fourcc, dimensions, num_objects, num_layers, per-object size + modifier, per-layer format, per-plane offset + pitch all field-diffed). Hitting the NVENC concurrent-session cap reports SKIP, not FAIL. |
 | `tests/test_ffmpeg.sh` | End-to-end ffmpeg + VA-API smoke test. Defaults to `samples/smptebars_h264.mp4` (produced by `samples/gensamples.sh`); override with a positional path argument. |
+| `tests/test_encode_roundtrip.sh` | Encode → software-decode → PSNR roundtrip for each hardware codec (H.264, HEVC, AV1). Reference and decoded output are both dumped to raw yuv420p so no container colorspace-label mismatch pollutes the comparison. Threshold 30 dB — sits solidly between "legit lossy encode at 20 Mbps" (typically 40-70 dB on the fixtures) and "bitstream garbage" (typically low-20s or worse). Two fixtures: the shipped smpte bars, plus a high-frequency testsrc2 stress source generated at test time. Current known failure: `hevc_vaapi` on the stress fixture (RPS reconstruction on the second GOP boundary — see [Known limitations](#known-limitations)). |
 | `tests/test_gstreamer.sh` | End-to-end GStreamer VA-API smoke test. |
 
 Every code change to this fork lands with a test — see [Development workflow](#development-workflow) below.
@@ -538,6 +594,45 @@ efortin PR #427 base and elFarto's upstream master. See
   `VAEncPictureParameterBufferH264`/`HEVC` is picked up too — in CONSTQP
   mode `nvenc_reconfigure_if_needed` rewrites `constQP` before the next
   encode when the requested QP moves.
+- **AV1 VUI + chroma pinning** — `NV_ENC_CONFIG_AV1.chromaFormatIDC = 1`
+  (bit-packed field, defaults to 0 from `memset` which mis-parses
+  chroma at the receive side), plus explicit `colorRange = pc`,
+  BT.709 primaries / transfer / matrix. Matches Chrome / WebRTC's
+  default full-range BT.709 capture pipeline so a same-tab AV1
+  loopback decodes with correct hue and range. Verified externally
+  via `libdav1d` on a captured Chrome loopback bytestream.
+- **Client-driven IDR (`gopLength = infinite` for all codecs)** — the
+  client (ffmpeg / Chrome / Steam) is the sole IDR scheduler via
+  `VAEncPictureParameterBuffer.idr_pic_flag → NV_ENC_PIC_FLAG_FORCEIDR`.
+  NVENC no longer auto-inserts its own IDR at `intraPeriod`
+  boundaries, removing the two-scheduler race that produced
+  RPS-inconsistent bitstreams at GOP boundaries. WebRTC-canonical
+  shape anyway (BWE + PLI drive keyframes explicitly).
+- **HEVC defensive config** — `repeatSPSPPS = 1` (re-emit VPS/SPS/PPS
+  on every IDR so mid-stream joiners and packet-loss recoverers can
+  resync), `maxNumRefFramesInDPB = 4` (pin DPB size to what the
+  low-latency preset actually uses), explicit `idrPeriod = infinite`
+  (belt-and-suspenders with `gopLength = infinite` above). Also
+  routes `inputBitDepth` / `outputBitDepth` and `chromaFormatIDC`
+  (1=4:2:0, 2=4:2:2, 3=4:4:4) from the actual NVENC input format
+  for the new HEVC profile variants.
+- **Encode roundtrip PSNR test** — `tests/test_encode_roundtrip.sh`
+  encodes via our VA-API driver, decodes with a software decoder
+  (`libdav1d` for AV1, ffmpeg native for H.264/HEVC), and measures
+  PSNR against raw-YUV reference. Threshold 30 dB. Both sides are
+  raw yuv420p so container colorspace-label mismatches don't
+  pollute the comparison. Catches bitstream-correctness bugs that
+  "encode succeeded and produced bytes" tests happily miss (the
+  original AV1 chromaFormatIDC regression scored 22-25 dB before
+  the fix; correctly-configured encoders score 40-70 dB).
+- **Multi-session concurrency test** — `tests/test_concurrent_sessions.c`
+  covers the WebRTC "camera + screenshare" scenario: parallel
+  encoders at the same resolution, staggered second-encoder-added-
+  mid-stream, encoder + decoder co-existence at the same resolution,
+  rapid create/destroy churn, and a descriptor-shape stability probe
+  that asserts our DMA-BUF exports are bit-identical whether taken
+  cold or during a concurrent live encoder. Consumer-card NVENC
+  session cap is detected and reported as SKIP, not FAIL.
 - **NVENC out-of-process helper** — `nvenc-helper.service` (user systemd unit)
   + `/usr/libexec/nvenc-helper` binary + IPC channel for sandboxed browser
   processes that can't init CUDA/NVENC directly. Rebuild + restart with
