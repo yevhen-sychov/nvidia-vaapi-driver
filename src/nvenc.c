@@ -192,16 +192,40 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
     }
 
     if (memcmp(&codecGuid, &NV_ENC_CODEC_AV1_GUID, sizeof(GUID)) == 0) {
+        NV_ENC_CONFIG_AV1 *av1 = &nvencCtx->encodeConfig.encodeCodecConfig.av1Config;
         if (nvencCtx->inputFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) {
-            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.inputBitDepth = NV_ENC_BIT_DEPTH_10;
-            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.outputBitDepth = NV_ENC_BIT_DEPTH_10;
+            av1->inputBitDepth = NV_ENC_BIT_DEPTH_10;
+            av1->outputBitDepth = NV_ENC_BIT_DEPTH_10;
         } else {
-            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.inputBitDepth = NV_ENC_BIT_DEPTH_8;
-            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.outputBitDepth = NV_ENC_BIT_DEPTH_8;
+            av1->inputBitDepth = NV_ENC_BIT_DEPTH_8;
+            av1->outputBitDepth = NV_ENC_BIT_DEPTH_8;
         }
-        nvencCtx->encodeConfig.encodeCodecConfig.av1Config.repeatSeqHdr = 1;
-        nvencCtx->encodeConfig.encodeCodecConfig.av1Config.idrPeriod = nvencCtx->intraPeriod > 0 ? nvencCtx->intraPeriod : 0xffffffff;
-        nvencCtx->encodeConfig.encodeCodecConfig.av1Config.maxNumRefFramesInDPB = 8;
+        /* AV1 chroma format. The NV_ENC_CONFIG_AV1.chromaFormatIDC field is
+         * bit-packed and defaults to 0 when the preset config is zeroed —
+         * but NVENC's own docs say it *must* be set to 1 for 4:2:0 input
+         * (YUV444 is not currently supported for AV1 encode). Without this
+         * explicit pin the encoder emits a stream whose chroma-plane layout
+         * doesn't match the actual NV12 input; decoders then render a
+         * saturated pink/magenta blob because chroma is sampled with the
+         * wrong stride, plus a green tail where later frames drift from
+         * corrupted references. Reproduced in a WebRTC loopback at
+         * 3824x1792; H.264 at the same resolution stayed clean because its
+         * h264->chromaFormatIDC is also pinned to 1 above. */
+        av1->chromaFormatIDC = 1;
+        /* WebRTC (and most desktop / Chrome content) transports full-swing
+         * YUV [0..255] with BT.709 primaries + matrix. NVENC's default of
+         * colorRange=0 (studio swing 16..235) + unset color* fields
+         * produces washed-out / off-hue output when Chrome's decoder
+         * assumes BT.709 full-range. Setting these lands the correct VUI
+         * in the encoded sequence header so decoders reconstruct colors
+         * consistently across sender ↔ receiver. */
+        av1->colorRange = 1;
+        av1->colorPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+        av1->transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+        av1->matrixCoefficients = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+        av1->repeatSeqHdr = 1;
+        av1->idrPeriod = nvencCtx->intraPeriod > 0 ? nvencCtx->intraPeriod : 0xffffffff;
+        av1->maxNumRefFramesInDPB = 8;
 
         /* Temporal SVC (e.g. WebRTC L1T2/L1T3 screenshare). Only enable when the
          * application actually requested more than one temporal layer, otherwise
@@ -211,14 +235,14 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
             if (layers > 4) {
                 layers = 4; /* NVENC AV1 supports up to 4 temporal layers */
             }
-            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.enableTemporalSVC = 1;
-            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.numTemporalLayers = layers;
-            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.maxTemporalLayersMinus1 = layers - 1;
+            av1->enableTemporalSVC = 1;
+            av1->numTemporalLayers = layers;
+            av1->maxTemporalLayersMinus1 = layers - 1;
             LOG("NVENC: AV1 temporal SVC enabled, layers=%u", layers);
         } else {
-            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.enableTemporalSVC = 0;
-            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.numTemporalLayers = 0;
-            nvencCtx->encodeConfig.encodeCodecConfig.av1Config.maxTemporalLayersMinus1 = 0;
+            av1->enableTemporalSVC = 0;
+            av1->numTemporalLayers = 0;
+            av1->maxTemporalLayersMinus1 = 0;
         }
     }
 
