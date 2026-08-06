@@ -367,27 +367,6 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
         nvencCtx->rcMode, nvencCtx->bitrate, nvencCtx->maxBitrate,
         nvencCtx->encodeConfig.gopLength, nvencCtx->initParams.frameRateNum, nvencCtx->initParams.frameRateDen);
 
-    /* Detailed dump for the bytestream investigation flow: when
-     * NVD_ENC_DUMP_FILE is set (see nvenc_dispatch.c), also log the
-     * full codec-side config so we can correlate the raw bytes on
-     * disk with what NVENC was actually told. Guarded on the same env
-     * var so the noise stays off outside of investigation. */
-    if (getenv("NVD_ENC_DUMP_FILE") != NULL) {
-        const char *codec =
-            memcmp(&codecGuid, &NV_ENC_CODEC_H264_GUID, sizeof(GUID)) == 0 ? "H.264" :
-            memcmp(&codecGuid, &NV_ENC_CODEC_HEVC_GUID, sizeof(GUID)) == 0 ? "HEVC"  :
-            memcmp(&codecGuid, &NV_ENC_CODEC_AV1_GUID,  sizeof(GUID)) == 0 ? "AV1"   :
-            "unknown";
-        LOG("NVENC DUMP: codec=%s, %ux%u, inputFmt=0x%x, tuning=%d, preset=P%u, "
-            "temporalLayers=%u, allowBframes=%d, intraPeriod=%u, ipPeriod=%u, "
-            "vbvBuf=%u, vbvDelay=%u",
-            codec, width, height, nvencCtx->inputFormat, tuningInfo,
-            nvencCtx->qualityLevel ? nvencCtx->qualityLevel : 4,
-            nvencCtx->numTemporalLayers, nvencCtx->allowBframes,
-            nvencCtx->intraPeriod, nvencCtx->ipPeriod,
-            nvencCtx->vbvBufferSize, nvencCtx->vbvInitialDelay);
-    }
-
     st = nvencCtx->funcs.nvEncInitializeEncoder(nvencCtx->encoder, &nvencCtx->initParams);
     if (!CHECK_NVENC(st)) {
         return false;
