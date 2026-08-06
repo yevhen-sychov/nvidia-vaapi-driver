@@ -181,6 +181,30 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
             hevc->chromaFormatIDC = 1;
             break;
         }
+        /* Reference-picture / DPB management for HEVC.
+         *
+         * repeatSPSPPS=1 makes the encoder re-emit VPS/SPS/PPS on every
+         * IDR frame so a decoder joining mid-stream or recovering from
+         * packet loss can resynchronize (WebRTC needs this too).
+         *
+         * idrPeriod = NVENC_INFINITE_GOPLENGTH: NEVER auto-insert an IDR.
+         * Otherwise NVENC emits its own IDR every `intraPeriod` frames
+         * INDEPENDENT of the client's forceIDR flow, and the two
+         * IDR-insertion machines race — client-driven RPS assumes one
+         * IDR position, NVENC-inserted IDR is at a different position,
+         * and the decoder ends up with a slice whose RPS references
+         * POCs the DPB no longer holds ("Could not find ref with POC X
+         * / Error constructing frame RPS", reproduced on high-detail
+         * content across the second GOP boundary). Letting the client
+         * (or upstream nvenc_dispatch's forceIDR path) drive every IDR
+         * eliminates the race and matches the H.264 config that is
+         * already stable in this fork.
+         *
+         * maxNumRefFramesInDPB=4 caps DPB size at a value NVENC's
+         * low-latency preset actually uses. */
+        hevc->repeatSPSPPS = 1;
+        hevc->idrPeriod = 0xffffffff;  /* NVENC_INFINITE_GOPLENGTH */
+        hevc->maxNumRefFramesInDPB = 4;
     }
 
     if (memcmp(&codecGuid, &NV_ENC_CODEC_H264_GUID, sizeof(GUID)) == 0) {
@@ -303,11 +327,19 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
         nvencCtx->encodeConfig.rcParams.initialRCQP.qpIntra  = nvencCtx->initialQP;
     }
 
-    if (nvencCtx->intraPeriod > 0) {
-        nvencCtx->encodeConfig.gopLength = nvencCtx->intraPeriod;
-    } else {
-        nvencCtx->encodeConfig.gopLength = 0xffffffff; /* Infinite GOP per VA-API default */
-    }
+    /* gopLength = infinite ALWAYS. The VA-API client (ffmpeg, Chrome,
+     * Steam) drives IDR insertion explicitly via idr_pic_flag on
+     * VAEncPictureParameterBuffer — which we translate to
+     * NV_ENC_PIC_FLAG_FORCEIDR in nvenc_dispatch's per-frame encode
+     * call. Letting NVENC also emit its own IDR every intraPeriod
+     * frames creates a race: two IDR-scheduling machines produce
+     * conflicting RPS state ("Could not find ref with POC X / Error
+     * constructing frame RPS" on HEVC across the second GOP boundary
+     * on high-detail content; the roundtrip test now catches it).
+     * `intraPeriod` from the client becomes advisory info; the actual
+     * IDR cadence is whatever forceIDR sends. */
+    (void)nvencCtx->intraPeriod;
+    nvencCtx->encodeConfig.gopLength = 0xffffffff;
     if (nvencCtx->allowBframes) {
         nvencCtx->encodeConfig.frameIntervalP = (nvencCtx->ipPeriod > 0) ? nvencCtx->ipPeriod : 3;
     } else {

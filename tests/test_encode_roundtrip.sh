@@ -82,29 +82,33 @@ FAIL=0
 SKIP=0
 
 # ---- Runner ------------------------------------------------------------
+#
+# The comparison is on raw YUV, not on container-decoded frames. Rationale:
+# ffmpeg's psnr filter compares raw pixel values, and different container
+# color-metadata labels (color_range, colorspace, primaries) cause the
+# decoder to apply different studio↔full-range conversions on the two
+# sides — which makes PSNR fall to ~25 dB for VISUALLY IDENTICAL frames
+# whose only difference is a colorspace tag. Comparing raw YUV bypasses
+# every container-side interpretation and measures the encoder alone.
 run_one_codec() {
     local encoder="$1"
     local ext="$2"
     local swdec="$3"
-    local label="$encoder"
+    local width="$4"
+    local height="$5"
 
     echo -n "  $encoder → PSNR ... "
 
     local encoded="$TMPDIR/$encoder.$ext"
+    local decoded_yuv="$TMPDIR/$encoder.decoded.yuv"
     local enc_log="$TMPDIR/$encoder.enc.log"
-    local psnr_log="$TMPDIR/$encoder.psnr.log"
 
-    # Encode via VA-API. Input is SOFTWARE-decoded (no -hwaccel) so this
-    # test isolates the encode path — a broken VA-API H.264 decode
-    # wouldn't skip the test as if the encoder were unavailable. The
-    # `format=nv12,hwupload` filter pushes decoded frames onto the VA
-    # surface pool for the hardware encoder. -bf 0 disables B-frames
-    # (our fork doesn't wire them). -g 30 fixed GOP. High bitrate
-    # (20 Mbps) intentionally over-provisions — this test is about
-    # encoder CORRECTNESS not compression efficiency; at 20 Mbps any
-    # correctly-configured encoder should score >= threshold on both
-    # fixtures. A low PSNR at 20 Mbps means the bitstream itself is
-    # broken (wrong chroma format, wrong colorspace, corrupt refs).
+    # Encode via VA-API. -bf 0 disables B-frames (our fork doesn't wire
+    # them). -g 30 fixed GOP. 20 Mbps intentionally over-provisions — this
+    # test is about encoder CORRECTNESS not compression efficiency; at
+    # 20 Mbps any correctly-configured encoder should score >= threshold.
+    # A low PSNR at 20 Mbps means the bitstream itself is broken (wrong
+    # chroma format, corrupt reference frames, wrong bit-depth).
     if ! "$FFMPEG" -y -hide_banner -loglevel error \
             -init_hw_device "vaapi=va:$RENDER_NODE" \
             -filter_hw_device va \
@@ -120,22 +124,28 @@ run_one_codec() {
         return
     fi
 
-    # Decode + compare. The `psnr` filter needs two synced streams: the
-    # first input is [0:v] (reference = original), the second is [1:v]
-    # (encoded output decoded via ffmpeg's software decoder). We force
-    # the AV1 decoder explicitly (libdav1d) for that codec; for h264/hevc
-    # ffmpeg picks its native software decoder by default.
+    # Software-decode the encoded output back to raw YUV so we compare
+    # pixel values with no colorspace/range interpretation in the loop.
     local dec_args=()
     if [ -n "$swdec" ]; then
         dec_args=(-c:v "$swdec")
     fi
-
-    # psnr filter emits per-frame stats to stats_file and an "average:X.X"
-    # summary to stderr. We grep the summary out of the ffmpeg output.
-    "$FFMPEG" -y -hide_banner -loglevel info \
-            -i "$INPUT" \
+    if ! "$FFMPEG" -y -hide_banner -loglevel error \
             "${dec_args[@]}" -i "$encoded" \
-            -lavfi "[0:v][1:v]psnr=stats_file='$psnr_log'" \
+            -f rawvideo -pix_fmt yuv420p \
+            "$decoded_yuv" 2>"$TMPDIR/$encoder.dec.log"; then
+        echo "FAIL (software decode of encoded output failed)"
+        head -3 "$TMPDIR/$encoder.dec.log" | sed 's/^/      | /'
+        FAIL=$((FAIL + 1))
+        return
+    fi
+
+    # Compute PSNR against the reference raw YUV (both are yuv420p at the
+    # same known resolution). The psnr filter's average lands on stderr.
+    "$FFMPEG" -y -hide_banner -loglevel info \
+            -f rawvideo -pix_fmt yuv420p -s "${width}x${height}" -r 30 -i "$REF_YUV" \
+            -f rawvideo -pix_fmt yuv420p -s "${width}x${height}" -r 30 -i "$decoded_yuv" \
+            -lavfi "[0:v][1:v]psnr" \
             -f null - > "$TMPDIR/$encoder.compare.log" 2>&1
 
     local avg
@@ -149,7 +159,6 @@ run_one_codec() {
         return
     fi
 
-    # bc -l for floating comparison. Threshold defaults to 20 dB.
     if [ "$(echo "$avg < $THRESHOLD" | bc -l)" = "1" ]; then
         echo "FAIL (PSNR=$avg dB < ${THRESHOLD} dB → bitstream corruption)"
         FAIL=$((FAIL + 1))
@@ -162,12 +171,23 @@ run_one_codec() {
 run_all_codecs() {
     local input="$1"
     local label="$2"
+    local width="$3"
+    local height="$4"
     local saved_input="$INPUT"
     INPUT="$input"
-    echo "-- fixture: $label ($(basename "$input"))"
+    # Reference YUV for PSNR: decode source once to raw YUV, reuse across
+    # every codec run. Same-format-both-sides removes any container-
+    # metadata / colorspace-conversion difference from the comparison.
+    REF_YUV="$TMPDIR/$(basename "$input").ref.yuv"
+    if ! "$FFMPEG" -y -hide_banner -loglevel error \
+            -i "$input" -f rawvideo -pix_fmt yuv420p "$REF_YUV" 2>/dev/null; then
+        echo "  ERROR: could not decode reference $input"
+        return
+    fi
+    echo "-- fixture: $label ($(basename "$input"), ${width}x${height})"
     for codec_spec in "${CODECS[@]}"; do
         IFS=':' read -r ENCODER EXT SWDEC <<< "$codec_spec"
-        run_one_codec "$ENCODER" "$EXT" "$SWDEC"
+        run_one_codec "$ENCODER" "$EXT" "$SWDEC" "$width" "$height"
     done
     INPUT="$saved_input"
     echo
@@ -180,9 +200,9 @@ echo "Driver:    ${LIBVA_DRIVER_NAME:-<default>} at ${LIBVA_DRIVERS_PATH:-<defau
 echo "Threshold: ${THRESHOLD} dB (below this = bitstream garbage)"
 echo
 
-run_all_codecs "$INPUT" "smpte bars, 640x360"
+run_all_codecs "$INPUT" "smpte bars" 640 360
 if [ -n "$STRESS_INPUT" ] && [ -f "$STRESS_INPUT" ]; then
-    run_all_codecs "$STRESS_INPUT" "high-detail mandelbrot, 1920x1088"
+    run_all_codecs "$STRESS_INPUT" "high-detail testsrc2" 1280 720
 fi
 
 echo "=== Roundtrip: $PASS passed, $FAIL failed, $SKIP skipped ==="
