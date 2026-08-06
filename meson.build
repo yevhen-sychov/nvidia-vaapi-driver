@@ -127,7 +127,12 @@ if not meson.is_cross_build()
 
     test_encode = executable('test_encode', 'tests/test_encode.c',
         dependencies : libva_test_deps, install : false)
-    test('encode', test_encode, timeout : 60, env : test_env)
+    # Encoder tests hammer the NVENC engine hard — run them serially
+    # (is_parallel:false) so they don't contend with each other for
+    # concurrent-session capacity on consumer cards. Same reason for
+    # encode_roundtrip below.
+    test('encode', test_encode, timeout : 60, env : test_env,
+         is_parallel : false)
 
     test_encode_config = executable('test_encode_config', 'tests/test_encode_config.c',
         dependencies : libva_test_deps, install : false)
@@ -174,6 +179,19 @@ if not meson.is_cross_build()
              args: [meson.current_source_dir() + '/samples/smptebars_h264.mp4'],
              timeout : 120,
              env : test_env)
+
+        # Roundtrip: encode via our VA-API driver, decode via software,
+        # measure PSNR. Catches bitstream corruption bugs that pass an
+        # "encode succeeded" check but produce garbage frames — e.g.
+        # missing NV_ENC_CONFIG.chromaFormatIDC. Uses libx264 (bundled
+        # with ffmpeg) to generate a high-detail testsrc2 stress fixture
+        # at runtime.
+        test('encode_roundtrip',
+             find_program('tests/test_encode_roundtrip.sh'),
+             args: [meson.current_source_dir() + '/samples/smptebars_h264.mp4'],
+             timeout : 180,
+             env : test_env,
+             is_parallel : false)
     endif
 endif
 
