@@ -8,9 +8,21 @@ void hevcenc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     VAEncSequenceParameterBufferHEVC *seq =
         (VAEncSequenceParameterBufferHEVC*) buffer->ptr;
 
-    LOG("HEVC encode: seq params %ux%u, intra_period=%u, ip_period=%u",
-        seq->pic_width_in_luma_samples, seq->pic_height_in_luma_samples,
-        seq->intra_period, seq->ip_period);
+    /* Resent every frame by some clients; log only on change. */
+    if (LOG_ENABLED()) {
+        const NVENCSeqLog seqLog = {
+            .width = seq->pic_width_in_luma_samples,
+            .height = seq->pic_height_in_luma_samples,
+            .intraPeriod = seq->intra_period,
+            .ipPeriod = seq->ip_period,
+            .bitsPerSecond = seq->bits_per_second,
+        };
+        if (nvenc_log_state_changed(&nvencCtx->loggedSeq, &seqLog, sizeof(seqLog))) {
+            LOG("HEVC encode: seq params %ux%u, intra_period=%u, ip_period=%u, bitrate=%u",
+                seqLog.width, seqLog.height, seqLog.intraPeriod, seqLog.ipPeriod,
+                seqLog.bitsPerSecond);
+        }
+    }
 
     nvencCtx->width = seq->pic_width_in_luma_samples;
     nvencCtx->height = seq->pic_height_in_luma_samples;
@@ -89,8 +101,19 @@ void hevcenc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     case VAEncMiscParameterTypeRateControl: {
         VAEncMiscParameterRateControl *rc =
             (VAEncMiscParameterRateControl*) misc->data;
-        LOG("HEVC encode: rate control bits_per_second=%u qp{init=%u min=%u max=%u}",
-            rc->bits_per_second, rc->initial_qp, rc->min_qp, rc->max_qp);
+        if (LOG_ENABLED()) {
+            const NVENCRateLog rateLog = {
+                .bitsPerSecond = rc->bits_per_second,
+                .targetPercentage = rc->target_percentage,
+                .initialQP = rc->initial_qp,
+                .minQP = rc->min_qp,
+                .maxQP = rc->max_qp,
+            };
+            if (nvenc_log_state_changed(&nvencCtx->loggedRate, &rateLog, sizeof(rateLog))) {
+                LOG("HEVC encode: rate control bits_per_second=%u qp{init=%u min=%u max=%u}",
+                    rc->bits_per_second, rc->initial_qp, rc->min_qp, rc->max_qp);
+            }
+        }
         if (rc->bits_per_second > 0) {
             nvencCtx->maxBitrate = rc->bits_per_second;
             if (rc->target_percentage > 0) {

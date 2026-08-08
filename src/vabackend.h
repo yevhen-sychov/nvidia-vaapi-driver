@@ -233,6 +233,14 @@ typedef struct _NVDriver
     bool                    nvencSupportsInputYUV444_10;
     bool                    nvencSupportsInputYUV422;    /* NV16 / P210 */
     bool                    nvencSupportsInputYUV422_10;
+    /* Maximum encode dimensions, per codec, from NV_ENC_CAPS_WIDTH_MAX /
+     * HEIGHT_MAX. These differ by codec and generation (H.264 is capped at
+     * 4096 on every current part, while HEVC and AV1 reach 8192), so a single
+     * hardcoded number either under-reports 8K HEVC/AV1 or over-promises
+     * H.264. Zero means "not probed" and callers fall back to a safe default. */
+    uint32_t                nvencMaxWidthH264,  nvencMaxHeightH264;
+    uint32_t                nvencMaxWidthHEVC,  nvencMaxHeightHEVC;
+    uint32_t                nvencMaxWidthAV1,   nvencMaxHeightAV1;
     CUmodule                videoProcModule;
     CUfunction              nv12ToArgbKernel;
     CUfunction              p010ToArgbKernel;
@@ -287,7 +295,19 @@ typedef struct _NVContext
     cudaVideoSurfaceFormat decoderSurfaceFormat;
     cudaVideoChromaFormat decoderChromaFormat;
     int                 decoderBitDepth;
-    int                 currentPictureId;
+    /* Bitmap of picture indices currently handed out to surfaces on this
+     * context. NVDEC addresses its decode surface array by this index, so it
+     * must be unique among *live* surfaces — but it can be reused once a
+     * surface is destroyed or moves to another context. surfaceCount is capped
+     * at 32, so one word covers every slot.
+     *
+     * This used to be a counter that only ever incremented, which meant a
+     * context could service at most surfaceCount distinct surfaces over its
+     * entire lifetime. See upstream issue #397. */
+    uint32_t            pictureIdxInUse;
+    /* Whether any picture has been started on this context yet — the decoder
+     * can only be reconfigured for a different surface format before that. */
+    bool                decodeStarted;
     pthread_t           resolveThread;
     bool                resolveThreadStarted;
     pthread_mutex_t     resolveMutex;
@@ -298,7 +318,6 @@ typedef struct _NVContext
     volatile bool       exiting;
     pthread_mutex_t     surfaceCreationMutex;
     int                 surfaceCount;
-    bool                firstKeyframeValid;
     bool                isEncode;
     void               *encodeData; /* NVENCContext* for encode contexts */
 } NVContext;
@@ -353,6 +372,8 @@ void appendBuffer(AppendableBuffer *ab, const void *buf, uint64_t size);
 int pictureIdxFromSurfaceId(NVDriver *ctx, VASurfaceID surf);
 NVSurface* nvSurfaceFromSurfaceId(NVDriver *drv, VASurfaceID surf);
 bool nvHasActiveEncodeContextWithResolution(NVDriver *drv, uint32_t width, uint32_t height);
+
+uint32_t nvExportableFourcc(uint32_t fourcc);
 // Cross-TU lookup / allocation helpers used by the moved encode dispatch code
 // (src/nvenc_dispatch.c) as well as vabackend.c itself.
 void *nvGetObjectPtr(NVDriver *drv, ObjectType type, VAGenericID id);
@@ -368,6 +389,20 @@ void nvBackingImageCopyColorMetadata(BackingImage *dst, const BackingImage *src)
 bool checkCudaErrors(CUresult err, const char *file, const char *function, const int line);
 void logger(const char *filename, const char *function, int line, const char *msg, ...);
 bool nvdLogDebugEnabled(void);
+
+/* True when NVD_LOG selected a destination. Exposed as a plain global rather
+ * than an accessor so LOG_ENABLED() compiles to a single load and can be used
+ * to skip work on hot paths without paying for a cross-TU call.
+ *
+ * LOG() itself is intentionally left unguarded — 76 call sites rely on the
+ * macro supplying its own trailing semicolon, so it cannot become a
+ * do/while(0) block. logger() early-returns when logging is off, which is
+ * fine for the once-per-session sites. What LOG_ENABLED() is for is guarding
+ * the *arguments*: any per-frame site that has to compute or compare something
+ * before it can decide whether to log must do that work behind this check, or
+ * it costs every frame whether or not anyone is listening. */
+extern bool nvdLoggingEnabled;
+#define LOG_ENABLED() (nvdLoggingEnabled)
 #define CHECK_CUDA_RESULT(err) checkCudaErrors(err, __FILE__, __func__, __LINE__)
 #define CHECK_CUDA_RESULT_RETURN(err, ret) if (checkCudaErrors(err, __FILE__, __func__, __LINE__)) { return ret; }
 #define cudaVideoCodec_NONE ((cudaVideoCodec) -1)

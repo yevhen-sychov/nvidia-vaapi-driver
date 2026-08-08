@@ -87,6 +87,7 @@ extern const NVCodec __start_nvd_codecs[];
 extern const NVCodec __stop_nvd_codecs[];
 
 static FILE *LOG_OUTPUT;
+bool nvdLoggingEnabled = false;
 static FILE *STATS_OUTPUT;
 static bool LOG_DEBUG_ENABLED;
 
@@ -98,6 +99,32 @@ FILE *nvStatsOutput(void) {
 
 static const uint64_t DEFAULT_MAX_DETACHED_BACKING_IMAGE_BYTES = 128ULL * 1024ULL * 1024ULL;
 static const uint32_t DEFAULT_MAX_DETACHED_BACKING_IMAGES = 16;
+
+/* Smallest surface height we are willing to advertise for zero-copy DMA-BUF
+ * export.
+ *
+ * NVIDIA's block-linear DRM format modifier encodes the GOB block height, and
+ * that is picked from each *plane's* height. A 4:2:0 chroma plane is half the
+ * luma height, so below a threshold chroma lands in a smaller block-height
+ * bucket than luma and the two planes carry genuinely different modifiers.
+ * Measured against this driver the two converge at exactly luma height 172,
+ * independent of width and identical for NV12 and P010 (see
+ * tests/test_descriptor_mode.c).
+ *
+ * Below the threshold there is no VADRMPRIMESurfaceDescriptor we can emit that
+ * is both correct and safe for real clients:
+ *   - one object per plane (MULTI) reports the true modifiers, but Chromium
+ *     does CHECK_EQ(objects[0].modifier, objects[i].modifier) in
+ *     ExportVASurfaceAsNativePixmapDmaBufUnwrapped — a GPU-process abort, not
+ *     a recoverable error;
+ *   - a single object (SINGLE/COMBINED) has room for exactly one modifier, so
+ *     the chroma plane gets described with luma's tiling and decodes to green
+ *     macroblocks.
+ *
+ * So we advertise a floor at (rounded up to a GOB-friendly 176) and clients
+ * transparently fall back to software for sub-QCIF content rather than getting
+ * a crash or corruption. This matches the mitigation in upstream issue #440. */
+#define MIN_EXPORTABLE_SURFACE_HEIGHT 176
 
 static int gpu = -1;
 static enum {
@@ -143,6 +170,31 @@ static NVFormat nvFormatFromSurfaceFourcc(uint32_t fourcc) {
         return NV_FORMAT_ARGB;
     }
     return nvFormatFromVaFormat(fourcc);
+}
+
+/* Map an internal surface fourcc to one that DMA-BUF importers actually
+ * understand, for use as VADRMPRIMESurfaceDescriptor::fourcc.
+ *
+ * Firefox's DMABufSurfaceYUV::ImportPRIMESurfaceDescriptor only handles NV12,
+ * YV12, P010 and P016, and Chromium's ExportVASurfaceAsNativePixmapDmaBuf only
+ * NV12, P010, IMC3 and ARGB. Neither knows P012, and neither rejects it
+ * cleanly — Firefox silently mis-imports and Chromium bails out of zero-copy.
+ *
+ * P012 and P016 are the same two-plane 16-bit-container layout; they differ
+ * only in how many of the container's bits are significant, and in both the
+ * samples are left-aligned so the unused low bits read as zero. Describing a
+ * P012 surface as P016 is therefore lossless for an importer, and it is what
+ * makes 12-bit HEVC/VP9 usable in a browser at all. The surface itself is still
+ * reported as P012 through vaQueryImageFormats and the surface attributes, so
+ * clients that do understand the distinction keep seeing it.
+ *
+ * Takes and returns a DRM fourcc — which for these formats is numerically the
+ * same code as the VA fourcc. */
+uint32_t nvExportableFourcc(uint32_t fourcc) {
+    if (fourcc == DRM_FORMAT_P012) {
+        return DRM_FORMAT_P016;
+    }
+    return fourcc;
 }
 
 static const char *fourccString(uint32_t fourcc, char out[5]) {
@@ -218,8 +270,17 @@ static void init() {
             }
         }
     }
+    /* Single source of truth for "is anyone listening", read by LOG_ENABLED()
+     * on hot paths. LOG_OUTPUT is only ever assigned here, in this constructor,
+     * so it cannot go stale. */
+    nvdLoggingEnabled = LOG_OUTPUT != NULL;
+
     char *nvdLogVerbose = getenv("NVD_LOG_VERBOSE");
-    LOG_DEBUG_ENABLED = nvdLogVerbose != NULL && strcmp(nvdLogVerbose, "0") != 0;
+    /* Verbose without a destination is pointless work — logger() would just
+     * drop it — so fold the destination check in here and let LOG_DEBUG's
+     * guard reject it before evaluating any arguments. */
+    LOG_DEBUG_ENABLED = LOG_OUTPUT != NULL &&
+                        nvdLogVerbose != NULL && strcmp(nvdLogVerbose, "0") != 0;
     char *nvdStats = getenv("NVD_STATS");
     if (nvdStats != NULL && strcmp(nvdStats, "0") != 0) {
         char *nvdStatsLog = getenv("NVD_STATS_LOG");
@@ -587,6 +648,7 @@ bool nvHasActiveEncodeContextWithResolution(NVDriver *drv, uint32_t width, uint3
 
 static void setSurfaceResolving(NVSurface *surface, bool resolving);
 static void waitSurfaceResolved(NVSurface *surface);
+static void releasePictureIdx(NVSurface *surface);
 
 static cudaVideoCodec vaToCuCodec(VAProfile profile) {
     for (const NVCodec *c = __start_nvd_codecs; c < __stop_nvd_codecs; c++) {
@@ -809,6 +871,44 @@ static VAStatus nvQueryConfigProfiles2(
         }
     }
 
+    /* Everything above enumerates what NVDEC can *decode*. Profiles that NVENC
+     * can encode but NVDEC cannot decode would otherwise never appear here, and
+     * since both Chromium and GStreamer enumerate profiles first and only then
+     * ask for entrypoints, an encode-only profile that is missing from this
+     * list is unreachable no matter what nvQueryConfigEntrypoints would say.
+     *
+     * Concretely this is what hid H.264 High10 (no decode branch at all) and
+     * HEVC Main422_10 (decode is #if 0'd out above because NVDEC has no 4:2:2
+     * support) on hardware whose encoder handles both. */
+    if (drv->nvencAvailable) {
+        nvenc_probe_caps(drv);
+        static const VAProfile encodeOnlyCandidates[] = {
+            VAProfileH264ConstrainedBaseline, VAProfileH264Main, VAProfileH264High,
+            VAProfileH264High10,
+            VAProfileHEVCMain, VAProfileHEVCMain10, VAProfileHEVCMain422_10,
+            VAProfileHEVCMain444, VAProfileHEVCMain444_10,
+            VAProfileAV1Profile0,
+        };
+        for (size_t i = 0; i < ARRAY_SIZE(encodeOnlyCandidates); i++) {
+            const VAProfile candidate = encodeOnlyCandidates[i];
+            if (!nvenc_is_encode_profile_supported(drv, candidate)) {
+                continue;
+            }
+            bool alreadyListed = false;
+            for (int j = 0; j < profiles; j++) {
+                if (profile_list[j] == candidate) { alreadyListed = true; break; }
+            }
+            if (alreadyListed) {
+                continue;
+            }
+            if (profiles >= MAX_PROFILES - 1) { //leave room for VAProfileNone
+                LOG("Profile list full, cannot advertise encode profile %d", candidate);
+                break;
+            }
+            profile_list[profiles++] = candidate;
+        }
+    }
+
     profile_list[profiles++] = VAProfileNone;
 
     *num_profiles = profiles;
@@ -911,7 +1011,12 @@ static void nvGetConfigAttributesDecode(
         }
         else
         {
+            /* The VA-API contract is that an attribute the driver does not
+             * implement comes back as VA_ATTRIB_NOT_SUPPORTED. Leaving the
+             * caller's value untouched means a client that pre-fills the array
+             * reads its own request back and concludes we support it. */
             LOG("unhandled config attribute: %d", attrib_list[i].type);
+            attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
         }
     }
 }
@@ -937,6 +1042,7 @@ static VAStatus nvGetConfigAttributes(
                 }
             } else {
                 LOG("unhandled vpp config attribute: %d", attrib_list[i].type);
+                attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
             }
         }
         return VA_STATUS_SUCCESS;
@@ -947,7 +1053,7 @@ static VAStatus nvGetConfigAttributes(
         if (!drv->nvencAvailable || !nvenc_is_encode_profile_supported(drv, profile)) {
             return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
         }
-        nvGetConfigAttributesEncode(profile, attrib_list, num_attribs);
+        nvGetConfigAttributesEncode(drv, profile, attrib_list, num_attribs);
         return VA_STATUS_SUCCESS;
     }
 
@@ -1822,6 +1928,13 @@ static VAStatus nvDestroySurfaces(
             drv->backend->detachBackingImageFromSurface(drv, surface);
         }
 
+        /* Hand the NVDEC picture index back so the context can reuse it. Without
+         * this a client that churns surfaces — Chromium's DmabufVideoFramePool
+         * does, across resolution changes and pool resizes — exhausts the
+         * context's 32 slots and every later vaBeginPicture fails with
+         * VA_STATUS_ERROR_MAX_NUM_EXCEEDED. */
+        releasePictureIdx(surface);
+
         deleteObject(drv, surface_list[i]);
     }
 
@@ -1976,8 +2089,7 @@ static VAStatus nvCreateContext(
     nvCtx->decoderChromaFormat = cfg->chromaFormat;
     nvCtx->decoderBitDepth = cfg->bitDepth;
     nvCtx->surfaceCount = surfaceCount;
-    nvCtx->firstKeyframeValid = false;
-    
+
     pthread_mutexattr_t attrib;
     pthread_mutexattr_init(&attrib);
     pthread_mutexattr_settype(&attrib, PTHREAD_MUTEX_RECURSIVE);
@@ -2017,9 +2129,63 @@ static VAStatus nvDestroyContext(
         ret = VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
+    /* Surfaces keep a raw back-pointer to the context they were last used on,
+     * and VA-API does not require a client to destroy its surfaces before the
+     * context. Anything that later reads surface->context — nvSyncSurface
+     * checking isEncode, nvGetImage, the VideoProc blit, releasePictureIdx —
+     * would be dereferencing freed memory. Clear the back-pointers here so
+     * "context is gone" is representable as NULL rather than as a dangling
+     * pointer whose behaviour depends on whether the allocator has reused the
+     * block yet. */
+    pthread_mutex_lock(&drv->objectCreationMutex);
+    ARRAY_FOR_EACH(Object, o, &drv->objects)
+        if (o->type == OBJECT_TYPE_SURFACE && o->obj != NULL) {
+            NVSurface *surface = (NVSurface*) o->obj;
+            if (surface->context == nvCtx) {
+                /* destroyContext() has already joined the resolve thread, so
+                 * any surface still queued for it will never be resolved.
+                 * Release the flag and wake anyone blocked in
+                 * waitSurfaceResolved(), otherwise a later vaSyncSurface or
+                 * vaExportSurfaceHandle on this surface blocks forever. */
+                setSurfaceResolving(surface, false);
+                surface->context = NULL;
+                surface->pictureIdx = -1;
+            }
+        }
+    END_FOR_EACH
+    pthread_mutex_unlock(&drv->objectCreationMutex);
+
     deleteObject(drv, context);
 
     return ret;
+}
+
+/* Claim the lowest free picture index on this context, or -1 if all
+ * surfaceCount slots are currently in use by live surfaces. */
+static int acquirePictureIdx(NVContext *nvCtx) {
+    const int limit = nvCtx->surfaceCount < 32 ? nvCtx->surfaceCount : 32;
+    for (int i = 0; i < limit; i++) {
+        if ((nvCtx->pictureIdxInUse & (1u << i)) == 0) {
+            nvCtx->pictureIdxInUse |= (1u << i);
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Return a surface's picture index to its context's pool. Safe to call on a
+ * surface that never had one, or whose context has already been destroyed —
+ * nvDestroyContext clears the back-pointer on every surface that referenced it,
+ * so a NULL check here is sufficient and never sees a dangling pointer. */
+static void releasePictureIdx(NVSurface *surface) {
+    if (surface == NULL || surface->pictureIdx < 0) {
+        return;
+    }
+    NVContext *nvCtx = (NVContext*) surface->context;
+    if (nvCtx != NULL && surface->pictureIdx < 32) {
+        nvCtx->pictureIdxInUse &= ~(1u << surface->pictureIdx);
+    }
+    surface->pictureIdx = -1;
 }
 
 static VAStatus recreateDecoderForSurface(NVContext *nvCtx, NVSurface *surface) {
@@ -2029,7 +2195,7 @@ static VAStatus recreateDecoderForSurface(NVContext *nvCtx, NVSurface *surface) 
         return VA_STATUS_SUCCESS;
     }
 
-    if (nvCtx->currentPictureId != 0) {
+    if (nvCtx->decodeStarted) {
         LOG("Decoder/surface format mismatch after decode start: decoder format=%d chroma=%d bitDepth=%d, surface format=%d chroma=%d bitDepth=%d",
             nvCtx->decoderSurfaceFormat, nvCtx->decoderChromaFormat, nvCtx->decoderBitDepth,
             surface->format, surface->chromaFormat, surface->bitDepth);
@@ -2137,15 +2303,16 @@ static VAStatus nvCreateBuffer(
         return VA_STATUS_SUCCESS;
     }
 
-    //HACK: This is an awful hack to support VP8 videos when running within FFMPEG.
-    //VA-API doesn't pass enough information for NVDEC to work with, but the information is there
-    //just before the start of the buffer that was passed to us.
-    size_t offset = 0;
-    if (nvCtx->profile == VAProfileVP8Version0_3 && type == VASliceDataBufferType) {
-        offset = ((uintptr_t) data) & 0xf;
-        data = ((char *) data) - offset;
-        size += (unsigned int)offset;
-    }
+    /* VP8 note: VA-API hands us slice data that begins at the first partition,
+     * with the VP8 "uncompressed data chunk" (frame tag, plus sync code and
+     * dimensions on a keyframe) already stripped — but NVDEC still expects it
+     * at the head of the bitstream. This used to be recovered by rewinding the
+     * client's pointer to the previous 16-byte boundary and reading whatever
+     * was there; see copyVP8SliceData() in src/vp8.c for why that was both a
+     * read behind a buffer we do not own and wrong in practice. The chunk is
+     * now reconstructed from the VA-API parameters instead, so nothing special
+     * happens here. */
+    const size_t offset = 0;
 
     //TODO should pool these as most of the time these should be the same size
     Object bufferObject = nvAllocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
@@ -2937,6 +3104,321 @@ fail:
     return false;
 }
 
+/* Bilinear sample of a single-channel 8- or 16-bit plane held in host memory.
+ * Coordinates are in plane space and may sit anywhere inside it; they are
+ * clamped at the edges. `stride` is in bytes, `channels` is the number of
+ * interleaved samples per pixel and `channel` selects one of them (so the
+ * packed UV plane of NV12 can be sampled as two separate planes). */
+static int bilinearSamplePlane(const uint8_t *plane, uint32_t stride,
+                               uint32_t width, uint32_t height,
+                               uint32_t bppc, uint32_t channels, uint32_t channel,
+                               float fx, float fy) {
+    if (width == 0 || height == 0) {
+        return 0;
+    }
+    if (fx < 0.0f) fx = 0.0f;
+    if (fy < 0.0f) fy = 0.0f;
+
+    uint32_t x0 = (uint32_t) fx;
+    uint32_t y0 = (uint32_t) fy;
+    if (x0 >= width)  x0 = width - 1;
+    if (y0 >= height) y0 = height - 1;
+    uint32_t x1 = x0 + 1 < width  ? x0 + 1 : x0;
+    uint32_t y1 = y0 + 1 < height ? y0 + 1 : y0;
+
+    const float tx = fx - (float) x0;
+    const float ty = fy - (float) y0;
+
+    const size_t pixelBytes = (size_t) bppc * channels;
+    const size_t channelOffset = (size_t) bppc * channel;
+
+    int s[4];
+    const uint32_t xs[4] = { x0, x1, x0, x1 };
+    const uint32_t ys[4] = { y0, y0, y1, y1 };
+    for (int i = 0; i < 4; i++) {
+        const uint8_t *p = plane + (size_t) ys[i] * stride + (size_t) xs[i] * pixelBytes + channelOffset;
+        s[i] = bppc == 2 ? (int) (*(const uint16_t*) p) : (int) (*p);
+    }
+
+    const float top = s[0] + (s[1] - s[0]) * tx;
+    const float bottom = s[2] + (s[3] - s[2]) * tx;
+    return (int) (top + (bottom - top) * ty + 0.5f);
+}
+
+/* Copy one plane of a BackingImage into a host buffer, cropped to `region`.
+ * Handles both CUDA-array-backed and externally-mapped (host) images. */
+static bool stagePlaneToHost(NVDriver *drv, const BackingImage *img, uint32_t planeIdx,
+                             VARectangle region, uint8_t *dstBuf, uint32_t dstStride) {
+    const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
+    const NVFormatPlane *p = &fmtInfo->plane[planeIdx];
+
+    const uint32_t planeX = (uint32_t) region.x >> p->ss.x;
+    const uint32_t planeY = (uint32_t) region.y >> p->ss.y;
+    const uint32_t planeW = (uint32_t) region.width >> p->ss.x;
+    const uint32_t planeH = (uint32_t) region.height >> p->ss.y;
+    const uint32_t rowBytes = planeW * fmtInfo->bppc * p->channelCount;
+    const uint32_t xBytes = planeX * fmtInfo->bppc * p->channelCount;
+
+    if (img->externalMapping != NULL) {
+        const uint8_t *srcBase = (const uint8_t*) img->externalMapping + img->offsets[planeIdx];
+        for (uint32_t row = 0; row < planeH; row++) {
+            memcpy(dstBuf + (size_t) row * dstStride,
+                   srcBase + (size_t) (planeY + row) * img->strides[planeIdx] + xBytes,
+                   rowBytes);
+        }
+        return true;
+    }
+
+    if (img->arrays[planeIdx] == NULL) {
+        return false;
+    }
+    CUDA_MEMCPY2D cpy = {
+        .srcXInBytes = xBytes,
+        .srcY = planeY,
+        .srcMemoryType = CU_MEMORYTYPE_ARRAY,
+        .srcArray = img->arrays[planeIdx],
+        .dstMemoryType = CU_MEMORYTYPE_HOST,
+        .dstHost = dstBuf,
+        .dstPitch = dstStride,
+        .WidthInBytes = rowBytes,
+        .Height = planeH,
+    };
+    return !CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy));
+}
+
+/* Write a host ARGB buffer into the destination image at `dstRegion`. */
+static bool writeArgbToDestination(NVDriver *drv, BackingImage *dstImg,
+                                   const uint8_t *argb, uint32_t argbStride,
+                                   VARectangle dstRegion) {
+    if (dstImg->externalMapping != NULL) {
+        uint8_t *base = (uint8_t*) dstImg->externalMapping + dstImg->offsets[0];
+        for (int row = 0; row < dstRegion.height; row++) {
+            memcpy(base + (size_t) (dstRegion.y + row) * dstImg->strides[0] + (size_t) dstRegion.x * 4,
+                   argb + (size_t) row * argbStride,
+                   (size_t) dstRegion.width * 4);
+        }
+        return true;
+    }
+    if (dstImg->arrays[0] == NULL) {
+        return false;
+    }
+    CUDA_MEMCPY2D cpy = {
+        .srcMemoryType = CU_MEMORYTYPE_HOST,
+        .srcHost = argb,
+        .srcPitch = argbStride,
+        .dstXInBytes = (size_t) dstRegion.x * 4,
+        .dstY = (uint32_t) dstRegion.y,
+        .dstMemoryType = CU_MEMORYTYPE_ARRAY,
+        .dstArray = dstImg->arrays[0],
+        .WidthInBytes = (size_t) dstRegion.width * 4,
+        .Height = (uint32_t) dstRegion.height,
+    };
+    return !CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy));
+}
+
+/* Host-side YUV -> RGB blit with arbitrary crop and scale.
+ *
+ * Used when the requested VideoProc geometry is not a 1:1 origin-aligned copy,
+ * which the PTX fast path cannot express — its kernels sample the source at the
+ * destination coordinate, so they only ever do an identity blit. Chromium's
+ * VaapiImageProcessorBackend asks for exactly this shape (source rectangle plus
+ * a different output size) whenever the decoded surface cannot be imported into
+ * EGL directly, and returning failure there costs the entire stream: Chromium
+ * falls back to software decode rather than retrying differently.
+ *
+ * Luma is sampled bilinearly; chroma is sampled bilinearly in its own
+ * (subsampled) plane space, treating the interleaved UV plane as two channels.
+ * This runs on the CPU — it is a correctness fallback, not the hot path, and
+ * only executes for non-identity geometry. */
+static bool resampleYuvToArgb(NVDriver *drv, BackingImage *srcImg, BackingImage *dstImg,
+                              VARectangle srcRegion, VARectangle dstRegion,
+                              const ColorMatrix *matrix, VideoProcSampleInfo sampleInfo) {
+    const NVFormatInfo *srcFmt = &formatsInfo[srcImg->format];
+    const uint32_t bppc = srcFmt->bppc;
+    const uint32_t sw = (uint32_t) srcRegion.width;
+    const uint32_t sh = (uint32_t) srcRegion.height;
+    const uint32_t dw = (uint32_t) dstRegion.width;
+    const uint32_t dh = (uint32_t) dstRegion.height;
+
+    const uint32_t yStride = sw * bppc;
+    const uint32_t uvStride = (sw / 2) * bppc * 2;
+    const uint32_t uvHeight = (sh + 1) / 2;
+    const size_t ySize = (size_t) yStride * sh;
+    const size_t uvSize = (size_t) uvStride * uvHeight;
+    const uint32_t argbStride = dw * 4;
+    const size_t argbSize = (size_t) argbStride * dh;
+
+    bool ok = false;
+    pthread_mutex_lock(&drv->exportMutex);
+
+    if (!ensureCpuVideoProcBuffer(&drv->cpuVideoProcYBuffer, &drv->cpuVideoProcYBufferSize, ySize) ||
+        !ensureCpuVideoProcBuffer(&drv->cpuVideoProcUVBuffer, &drv->cpuVideoProcUVBufferSize, uvSize) ||
+        !ensureCpuVideoProcBuffer(&drv->cpuVideoProcArgbBuffer, &drv->cpuVideoProcArgbBufferSize, argbSize)) {
+        goto out;
+    }
+
+    uint8_t *yPlane = drv->cpuVideoProcYBuffer;
+    uint8_t *uvPlane = drv->cpuVideoProcUVBuffer;
+    uint8_t *argb = drv->cpuVideoProcArgbBuffer;
+
+    if (!stagePlaneToHost(drv, srcImg, 0, srcRegion, yPlane, yStride) ||
+        !stagePlaneToHost(drv, srcImg, 1, srcRegion, uvPlane, uvStride)) {
+        goto out;
+    }
+
+    /* Map destination pixel centres back into the (already cropped) source. */
+    const float xScale = (float) sw / (float) dw;
+    const float yScale = (float) sh / (float) dh;
+
+    for (uint32_t dy = 0; dy < dh; dy++) {
+        const float sy = ((float) dy + 0.5f) * yScale - 0.5f;
+        const float cy = (sy - 0.5f) * 0.5f; /* chroma plane is half height */
+        uint8_t *outRow = argb + (size_t) dy * argbStride;
+
+        for (uint32_t dx = 0; dx < dw; dx++) {
+            const float sx = ((float) dx + 0.5f) * xScale - 0.5f;
+            const float cx = (sx - 0.5f) * 0.5f;
+
+            int yy = bilinearSamplePlane(yPlane, yStride, sw, sh, bppc, 1, 0, sx, sy);
+            int u  = bilinearSamplePlane(uvPlane, uvStride, sw / 2, uvHeight, bppc, 2, 0, cx, cy);
+            int v  = bilinearSamplePlane(uvPlane, uvStride, sw / 2, uvHeight, bppc, 2, 1, cx, cy);
+
+            yy >>= sampleInfo.sampleShift;
+            u  >>= sampleInfo.sampleShift;
+            v  >>= sampleInfo.sampleShift;
+
+            const int c = yy > sampleInfo.yOffset ? yy - sampleInfo.yOffset : 0;
+            const int d = u - sampleInfo.uvOffset;
+            const int e = v - sampleInfo.uvOffset;
+            const uint8_t r = clampU8((sampleInfo.yScale * c + matrix->vToR * e + sampleInfo.rounding) >> sampleInfo.valueShift);
+            const uint8_t g = clampU8((sampleInfo.yScale * c - matrix->uToG * d - matrix->vToG * e + sampleInfo.rounding) >> sampleInfo.valueShift);
+            const uint8_t b = clampU8((sampleInfo.yScale * c + matrix->uToB * d + sampleInfo.rounding) >> sampleInfo.valueShift);
+
+            writeRgbPixel(outRow + (size_t) dx * 4, (uint32_t) dstImg->fourcc, r, g, b);
+        }
+    }
+
+    ok = writeArgbToDestination(drv, dstImg, argb, argbStride, dstRegion);
+
+out:
+    pthread_mutex_unlock(&drv->exportMutex);
+    return ok;
+}
+
+/* Same-format crop and/or scale (e.g. NV12 -> NV12), plane by plane.
+ *
+ * A pure crop is done on the GPU with cuMemcpy2D source/destination offsets,
+ * which is exact and costs nothing extra. A size change falls back to host
+ * bilinear resampling, per plane, in the plane's own subsampled space. */
+static bool resampleSameFormat(NVDriver *drv, BackingImage *srcImg, BackingImage *dstImg,
+                               VARectangle srcRegion, VARectangle dstRegion) {
+    const NVFormatInfo *fmtInfo = &formatsInfo[srcImg->format];
+    const bool sameSize = srcRegion.width == dstRegion.width &&
+                          srcRegion.height == dstRegion.height;
+
+    if (sameSize) {
+        for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+            const NVFormatPlane *p = &fmtInfo->plane[i];
+            CUDA_MEMCPY2D cpy = {
+                .srcXInBytes = ((uint32_t) srcRegion.x >> p->ss.x) * fmtInfo->bppc * p->channelCount,
+                .srcY = (uint32_t) srcRegion.y >> p->ss.y,
+                .srcMemoryType = CU_MEMORYTYPE_ARRAY,
+                .srcArray = srcImg->arrays[i],
+                .dstXInBytes = ((uint32_t) dstRegion.x >> p->ss.x) * fmtInfo->bppc * p->channelCount,
+                .dstY = (uint32_t) dstRegion.y >> p->ss.y,
+                .dstMemoryType = CU_MEMORYTYPE_ARRAY,
+                .dstArray = dstImg->arrays[i],
+                .WidthInBytes = ((uint32_t) srcRegion.width >> p->ss.x) * fmtInfo->bppc * p->channelCount,
+                .Height = (uint32_t) srcRegion.height >> p->ss.y,
+            };
+            if (CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool ok = true;
+    pthread_mutex_lock(&drv->exportMutex);
+
+    for (uint32_t i = 0; i < fmtInfo->numPlanes && ok; i++) {
+        const NVFormatPlane *p = &fmtInfo->plane[i];
+        const uint32_t sw = (uint32_t) srcRegion.width >> p->ss.x;
+        const uint32_t sh = (uint32_t) srcRegion.height >> p->ss.y;
+        const uint32_t dw = (uint32_t) dstRegion.width >> p->ss.x;
+        const uint32_t dh = (uint32_t) dstRegion.height >> p->ss.y;
+        const uint32_t chans = p->channelCount;
+        const uint32_t srcStride = sw * fmtInfo->bppc * chans;
+        const uint32_t dstStride = dw * fmtInfo->bppc * chans;
+
+        if (sw == 0 || sh == 0 || dw == 0 || dh == 0) {
+            continue;
+        }
+        if (!ensureCpuVideoProcBuffer(&drv->cpuVideoProcYBuffer, &drv->cpuVideoProcYBufferSize,
+                                      (size_t) srcStride * sh) ||
+            !ensureCpuVideoProcBuffer(&drv->cpuVideoProcArgbBuffer, &drv->cpuVideoProcArgbBufferSize,
+                                      (size_t) dstStride * dh)) {
+            ok = false;
+            break;
+        }
+        uint8_t *srcBuf = drv->cpuVideoProcYBuffer;
+        uint8_t *dstBuf = drv->cpuVideoProcArgbBuffer;
+
+        if (!stagePlaneToHost(drv, srcImg, i, srcRegion, srcBuf, srcStride)) {
+            ok = false;
+            break;
+        }
+
+        const float xScale = (float) sw / (float) dw;
+        const float yScale = (float) sh / (float) dh;
+        for (uint32_t dy = 0; dy < dh; dy++) {
+            const float sy = ((float) dy + 0.5f) * yScale - 0.5f;
+            uint8_t *outRow = dstBuf + (size_t) dy * dstStride;
+            for (uint32_t dx = 0; dx < dw; dx++) {
+                const float sx = ((float) dx + 0.5f) * xScale - 0.5f;
+                for (uint32_t ch = 0; ch < chans; ch++) {
+                    const int s = bilinearSamplePlane(srcBuf, srcStride, sw, sh,
+                                                      fmtInfo->bppc, chans, ch, sx, sy);
+                    uint8_t *out = outRow + ((size_t) dx * chans + ch) * fmtInfo->bppc;
+                    if (fmtInfo->bppc == 2) {
+                        *(uint16_t*) out = (uint16_t) (s > 0xffff ? 0xffff : (s < 0 ? 0 : s));
+                    } else {
+                        *out = clampU8(s);
+                    }
+                }
+            }
+        }
+
+        if (dstImg->externalMapping != NULL) {
+            uint8_t *base = (uint8_t*) dstImg->externalMapping + dstImg->offsets[i];
+            const uint32_t dstX = ((uint32_t) dstRegion.x >> p->ss.x) * fmtInfo->bppc * chans;
+            const uint32_t dstY = (uint32_t) dstRegion.y >> p->ss.y;
+            for (uint32_t row = 0; row < dh; row++) {
+                memcpy(base + (size_t) (dstY + row) * dstImg->strides[i] + dstX,
+                       dstBuf + (size_t) row * dstStride, dstStride);
+            }
+        } else {
+            CUDA_MEMCPY2D cpy = {
+                .srcMemoryType = CU_MEMORYTYPE_HOST,
+                .srcHost = dstBuf,
+                .srcPitch = dstStride,
+                .dstXInBytes = ((uint32_t) dstRegion.x >> p->ss.x) * fmtInfo->bppc * chans,
+                .dstY = (uint32_t) dstRegion.y >> p->ss.y,
+                .dstMemoryType = CU_MEMORYTYPE_ARRAY,
+                .dstArray = dstImg->arrays[i],
+                .WidthInBytes = dstStride,
+                .Height = dh,
+            };
+            if (CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy))) {
+                ok = false;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&drv->exportMutex);
+    return ok;
+}
+
 static bool copySurfaceBackingImage(NVDriver *drv, NVSurface *src, NVSurface *dst, const VAProcPipelineParameterBuffer *pipeline) {
     if (src == NULL || dst == NULL || pipeline == NULL) {
         return false;
@@ -2951,13 +3433,26 @@ static bool copySurfaceBackingImage(NVDriver *drv, NVSurface *src, NVSurface *ds
         dstRegion = *pipeline->output_region;
     }
 
-    if (srcRegion.x != 0 || srcRegion.y != 0 || dstRegion.x != 0 || dstRegion.y != 0 ||
-        srcRegion.width != dstRegion.width || srcRegion.height != dstRegion.height) {
-        LOG("Unsupported VideoProc blit: src=%dx%d+%d+%d dst=%dx%d+%d+%d",
-            srcRegion.width, srcRegion.height, srcRegion.x, srcRegion.y,
-            dstRegion.width, dstRegion.height, dstRegion.x, dstRegion.y);
+    if (srcRegion.width <= 0 || srcRegion.height <= 0 ||
+        dstRegion.width <= 0 || dstRegion.height <= 0 ||
+        srcRegion.x < 0 || srcRegion.y < 0 || dstRegion.x < 0 || dstRegion.y < 0 ||
+        (uint32_t) (srcRegion.x + srcRegion.width) > src->width ||
+        (uint32_t) (srcRegion.y + srcRegion.height) > src->height ||
+        (uint32_t) (dstRegion.x + dstRegion.width) > dst->width ||
+        (uint32_t) (dstRegion.y + dstRegion.height) > dst->height) {
+        LOG("Out-of-bounds VideoProc blit: src=%dx%d+%d+%d (surface %ux%u) dst=%dx%d+%d+%d (surface %ux%u)",
+            srcRegion.width, srcRegion.height, srcRegion.x, srcRegion.y, src->width, src->height,
+            dstRegion.width, dstRegion.height, dstRegion.x, dstRegion.y, dst->width, dst->height);
         return false;
     }
+
+    /* An origin-aligned, same-size blit is the common case and keeps the GPU
+     * fast path below. Anything else — a source crop, a different output size,
+     * or a non-zero destination origin — goes through the resampling path. */
+    const bool identityGeometry = srcRegion.x == 0 && srcRegion.y == 0 &&
+                                  dstRegion.x == 0 && dstRegion.y == 0 &&
+                                  srcRegion.width == dstRegion.width &&
+                                  srcRegion.height == dstRegion.height;
 
     waitSurfaceResolved(src);
 
@@ -2991,7 +3486,9 @@ static bool copySurfaceBackingImage(NVDriver *drv, NVSurface *src, NVSurface *ds
             effectiveRangeName(fullRange),
             colorMatrixName(matrix), matrix->vToR, matrix->uToG, matrix->vToG, matrix->uToB,
             sampleInfo.sampleShift, sampleInfo.yScale, sampleInfo.yOffset, sampleInfo.uvOffset, sampleInfo.valueShift);
-        bool ret = convertNV12ToARGB(drv, srcImg, dstImg, srcRegion.width, srcRegion.height, matrix, sampleInfo);
+        bool ret = identityGeometry
+            ? convertNV12ToARGB(drv, srcImg, dstImg, srcRegion.width, srcRegion.height, matrix, sampleInfo)
+            : resampleYuvToArgb(drv, srcImg, dstImg, srcRegion, dstRegion, matrix, sampleInfo);
         bool popFailed = CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
         if (!ret) {
             return false;
@@ -3011,6 +3508,15 @@ static bool copySurfaceBackingImage(NVDriver *drv, NVSurface *src, NVSurface *ds
     }
 
     const NVFormatInfo *fmtInfo = &formatsInfo[srcImg->format];
+
+    if (!identityGeometry) {
+        const bool ok = resampleSameFormat(drv, srcImg, dstImg, srcRegion, dstRegion);
+        const bool popFailed = CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
+        if (!ok || popFailed) {
+            return false;
+        }
+        goto done;
+    }
 
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         const NVFormatPlane *p = &fmtInfo->plane[i];
@@ -3079,8 +3585,8 @@ static VAStatus nvBeginPicture(
         if (surface->backingImage != NULL) {
             drv->backend->detachBackingImageFromSurface(drv, surface);
         }
-        //...and reset the pictureIdx
-        surface->pictureIdx = -1;
+        //...and hand its picture index back to the context that owned it
+        releasePictureIdx(surface);
     }
 
     VAStatus decoderStatus = recreateDecoderForSurface(nvCtx, surface);
@@ -3088,13 +3594,16 @@ static VAStatus nvBeginPicture(
         return decoderStatus;
     }
 
-    //if this surface hasn't been used before, give it a new picture index
+    //if this surface hasn't been used before, give it a picture index
     if (surface->pictureIdx == -1) {
-        if (nvCtx->currentPictureId == nvCtx->surfaceCount) {
+        const int idx = acquirePictureIdx(nvCtx);
+        if (idx < 0) {
+            LOG("All %d picture indices are in use on this context", nvCtx->surfaceCount);
             return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
         }
-        surface->pictureIdx = nvCtx->currentPictureId++;
+        surface->pictureIdx = idx;
     }
+    nvCtx->decodeStarted = true;
 
     setSurfaceResolving(surface, true);
 
@@ -3392,9 +3901,16 @@ static VAStatus nvCreateImage(
      * An array indicating the scanline pitch in bytes for each plane.
      * Each plane may have a different pitch. Maximum 3 planes for planar formats
      */
-    image->pitches[0] = width * fmtInfo->bppc;
-    image->pitches[1] = width * fmtInfo->bppc;
-    image->pitches[2] = width * fmtInfo->bppc;
+    /* Row bytes must account for both chroma subsampling and the number of
+     * interleaved channels. width * bppc happens to be right for NV12/P010
+     * (the /2 horizontal subsampling of the UV plane cancels its 2 channels)
+     * and for the single-channel planar formats, but it is 4x too small for
+     * the packed RGB formats, which made vaGetImage/vaPutImage on an RGB image
+     * fail with CUDA_ERROR_INVALID_VALUE. */
+    for (uint32_t i = 0; i < 3; i++) {
+        const uint32_t planeIdx = i < fmtInfo->numPlanes ? i : fmtInfo->numPlanes - 1;
+        image->pitches[i] = (width >> p[planeIdx].ss.x) * fmtInfo->bppc * p[planeIdx].channelCount;
+    }
     /*
      * An array indicating the byte offset from the beginning of the image data
      * to the start of each plane.
@@ -3497,16 +4013,20 @@ static VAStatus nvGetImage(
         return VA_STATUS_ERROR_INVALID_IMAGE;
     }
 
-    NVContext *context = (NVContext*) surfaceObj->context;
     const NVFormatInfo *fmtInfo = &formatsInfo[imageObj->format];
     uint32_t offset = 0;
 
-    if (context == NULL) {
-        return VA_STATUS_ERROR_INVALID_CONTEXT;
-    }
-
     //wait for the surface to be decoded
     nvSyncSurface(ctx, surface);
+
+    /* What this actually needs is a realised backing image, not a decode
+     * context: vaGetImage carries no such requirement in VA-API, and a surface
+     * can legitimately hold pixels without ever having been a decode target —
+     * a VideoProc blit destination, or anything the client filled with
+     * vaPutImage. Checking surfaceObj->context instead made those unreadable. */
+    if (surfaceObj->backingImage == NULL) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
@@ -3519,7 +4039,7 @@ static VAStatus nvGetImage(
         .dstXInBytes = 0, .dstY = 0,
         .dstMemoryType = CU_MEMORYTYPE_HOST,
         .dstHost = (char *)imageObj->imageBuffer->ptr + offset,
-        .dstPitch = width * fmtInfo->bppc,
+        .dstPitch = (width >> p->ss.x) * fmtInfo->bppc * p->channelCount,
 
         .WidthInBytes = (width >> p->ss.x) * fmtInfo->bppc * p->channelCount,
         .Height = height >> p->ss.y
@@ -3604,7 +4124,7 @@ static VAStatus nvPutImage(
         uint32_t planeDstY = (uint32_t)((dest_y > 0 ? dest_y : 0)) >> p->ss.y;
         uint32_t planeCopyW = copyWidth >> p->ss.x;
         uint32_t planeCopyH = copyHeight >> p->ss.y;
-        uint32_t imgPlanePitch = imgWidth * fmtInfo->bppc;
+        uint32_t imgPlanePitch = (imgWidth >> p->ss.x) * fmtInfo->bppc * p->channelCount;
 
         CUDA_MEMCPY2D memcpy2d = {
             .srcXInBytes = planeSrcX * fmtInfo->bppc * p->channelCount,
@@ -3778,13 +4298,24 @@ static VAStatus nvQuerySurfaceAttributes(
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
 
-    /* Encode config surface attributes — GStreamer needs min/max dimensions */
+    /* Encode config surface attributes — GStreamer drops an element's caps
+     * entirely if these are missing or if Max < Min, and Chromium drops the
+     * profile with "Empty codec maximum resolution". */
     if (cfg->isEncode) {
-        int cnt = 5;
+        /* Profiles that can take both 8-bit and 10-bit input advertise both
+         * pixel formats. Reporting only one (keyed off cfg->bitDepth) hid the
+         * 8-bit path from clients that enumerate surface formats before
+         * deciding what to feed a 10-bit-capable profile. */
+        const bool dualDepth = cfg->profile == VAProfileHEVCMain10 ||
+                               cfg->profile == VAProfileAV1Profile0;
+        const int cnt = dualDepth ? 6 : 5;
         if (num_attribs != NULL) {
             *num_attribs = cnt;
         }
         if (attrib_list != NULL) {
+            uint32_t maxWidth = 0, maxHeight = 0;
+            nvenc_max_encode_dimensions(drv, cfg->profile, &maxWidth, &maxHeight);
+
             attrib_list[0].type = VASurfaceAttribMinWidth;
             attrib_list[0].flags = VA_SURFACE_ATTRIB_GETTABLE;
             attrib_list[0].value.type = VAGenericValueTypeInteger;
@@ -3798,17 +4329,24 @@ static VAStatus nvQuerySurfaceAttributes(
             attrib_list[2].type = VASurfaceAttribMaxWidth;
             attrib_list[2].flags = VA_SURFACE_ATTRIB_GETTABLE;
             attrib_list[2].value.type = VAGenericValueTypeInteger;
-            attrib_list[2].value.value.i = 4096;
+            attrib_list[2].value.value.i = (int) maxWidth;
 
             attrib_list[3].type = VASurfaceAttribMaxHeight;
             attrib_list[3].flags = VA_SURFACE_ATTRIB_GETTABLE;
             attrib_list[3].value.type = VAGenericValueTypeInteger;
-            attrib_list[3].value.value.i = 4096;
+            attrib_list[3].value.value.i = (int) maxHeight;
 
             attrib_list[4].type = VASurfaceAttribPixelFormat;
             attrib_list[4].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
             attrib_list[4].value.type = VAGenericValueTypeInteger;
             attrib_list[4].value.value.i = (cfg->bitDepth > 8) ? VA_FOURCC_P010 : VA_FOURCC_NV12;
+
+            if (dualDepth) {
+                attrib_list[5].type = VASurfaceAttribPixelFormat;
+                attrib_list[5].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+                attrib_list[5].value.type = VAGenericValueTypeInteger;
+                attrib_list[5].value.value.i = (cfg->bitDepth > 8) ? VA_FOURCC_NV12 : VA_FOURCC_P010;
+            }
         }
         return VA_STATUS_SUCCESS;
     }
@@ -3931,7 +4469,9 @@ static VAStatus nvQuerySurfaceAttributes(
         attrib_list[1].type = VASurfaceAttribMinHeight;
         attrib_list[1].flags = 0;
         attrib_list[1].value.type = VAGenericValueTypeInteger;
-        attrib_list[1].value.value.i = videoDecodeCaps.nMinHeight;
+        attrib_list[1].value.value.i = videoDecodeCaps.nMinHeight < MIN_EXPORTABLE_SURFACE_HEIGHT
+                                           ? MIN_EXPORTABLE_SURFACE_HEIGHT
+                                           : (int) videoDecodeCaps.nMinHeight;
 
         attrib_list[2].type = VASurfaceAttribMaxWidth;
         attrib_list[2].flags = 0;

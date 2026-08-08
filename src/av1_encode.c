@@ -10,8 +10,18 @@ void av1enc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     VAEncSequenceParameterBufferAV1 *seq =
         (VAEncSequenceParameterBufferAV1*) buffer->ptr;
 
-    LOG("AV1 encode: seq params, intra_period=%u, ip_period=%u, bitrate=%u",
-        seq->intra_period, seq->ip_period, seq->bits_per_second);
+    /* Resent every frame by Chromium; log only on change. */
+    if (LOG_ENABLED()) {
+        const NVENCSeqLog seqLog = {
+            .intraPeriod = seq->intra_period,
+            .ipPeriod = seq->ip_period,
+            .bitsPerSecond = seq->bits_per_second,
+        };
+        if (nvenc_log_state_changed(&nvencCtx->loggedSeq, &seqLog, sizeof(seqLog))) {
+            LOG("AV1 encode: seq params, intra_period=%u, ip_period=%u, bitrate=%u",
+                seq->intra_period, seq->ip_period, seq->bits_per_second);
+        }
+    }
 
     if (seq->intra_period > 0) {
         nvencCtx->intraPeriod = seq->intra_period;
@@ -40,6 +50,29 @@ void av1enc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     nvencCtx->height = pic->frame_height_minus_1 + 1;
     nvencCtx->currentCodedBufId = pic->coded_buf;
     nvencCtx->temporalId = pic->temporal_id;
+
+    /* Per-frame quantizer. This is the whole rate-control channel for AV1 under
+     * Chromium: its AV1 encoder delegate runs the config in CQP mode
+     * (kEncodeConstantQuantizationParameter) and drives quality entirely by
+     * updating base_qindex per frame from its own software rate controller —
+     * it sends no VAEncMiscParameterTypeRateControl at all. Dropping this field
+     * meant the browser's bitrate target had no effect whatsoever on the
+     * output.
+     *
+     * AV1's base_qindex is 0-255 and is exactly what NVENC's AV1 encoder takes
+     * as its QP, so it maps across without rescaling. picQP feeds
+     * nvenc_init_encoder()'s constQP wiring on the first frame and
+     * nvenc_reconfigure_if_needed() on every frame after that, so a changing
+     * qindex is applied live without rebuilding the session. */
+    if (pic->base_qindex > 0) {
+        nvencCtx->picQP = pic->base_qindex;
+    }
+    if (pic->min_base_qindex > 0) {
+        nvencCtx->minQP = pic->min_base_qindex;
+    }
+    if (pic->max_base_qindex > 0) {
+        nvencCtx->maxQP = pic->max_base_qindex;
+    }
 
     /* AV1 frame types: 0=KEY, 1=INTER, 2=INTRA_ONLY, 3=SWITCH */
     switch (pic->picture_flags.bits.frame_type) {
@@ -129,9 +162,12 @@ void av1enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
         VAEncMiscParameterTemporalLayerStructure *tl =
             (VAEncMiscParameterTemporalLayerStructure*) misc->data;
         if (tl->number_of_layers > 0) {
+            /* Also resent per frame — only report an actual change. */
+            if (LOG_ENABLED() && nvencCtx->numTemporalLayers != tl->number_of_layers) {
+                LOG("AV1 encode: temporal layer structure, number_of_layers=%u",
+                    tl->number_of_layers);
+            }
             nvencCtx->numTemporalLayers = tl->number_of_layers;
-            LOG("AV1 encode: temporal layer structure, number_of_layers=%u",
-                tl->number_of_layers);
         }
         break;
     }

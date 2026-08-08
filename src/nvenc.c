@@ -14,6 +14,23 @@ static bool check_nvenc_status(NVENCSTATUS status, const char *func, int line)
 }
 #define CHECK_NVENC(status) check_nvenc_status(status, __func__, __LINE__)
 
+bool nvenc_log_state_changed(void *last, const void *now, size_t size)
+{
+    /* Nothing is listening, so there is no state worth tracking — report "no
+     * change" without touching memory. Callers are expected to skip building
+     * the comparison value at all (see LOG_ENABLED()); this is the backstop
+     * for any that don't, so the cost of a missed guard is one predictable
+     * branch rather than a memcmp and memcpy on every frame. */
+    if (!LOG_ENABLED()) {
+        return false;
+    }
+    if (memcmp(last, now, size) == 0) {
+        return false;
+    }
+    memcpy(last, now, size);
+    return true;
+}
+
 bool nvenc_load(NvencFunctions **nvenc_dl)
 {
     int ret = nvenc_load_functions(nvenc_dl, NULL);
@@ -734,6 +751,42 @@ bool nvenc_is_encode_profile_supported(NVDriver *drv, VAProfile profile)
     }
 }
 
+/* Largest frame the encoder will accept for `profile`, in pixels.
+ *
+ * Falls back to 4096x4096 when the caps probe has not run (IPC-only builds have
+ * no CUDA context to open a scratch session with) — that is the conservative
+ * answer, since every NVENC generation supports at least 4K for every codec it
+ * implements. */
+void nvenc_max_encode_dimensions(NVDriver *drv, VAProfile profile,
+                                 uint32_t *width, uint32_t *height)
+{
+    uint32_t w = 0, h = 0;
+
+    switch (profile) {
+    case VAProfileH264ConstrainedBaseline:
+    case VAProfileH264Main:
+    case VAProfileH264High:
+    case VAProfileH264High10:
+        w = drv->nvencMaxWidthH264; h = drv->nvencMaxHeightH264;
+        break;
+    case VAProfileHEVCMain:
+    case VAProfileHEVCMain10:
+    case VAProfileHEVCMain422_10:
+    case VAProfileHEVCMain444:
+    case VAProfileHEVCMain444_10:
+        w = drv->nvencMaxWidthHEVC; h = drv->nvencMaxHeightHEVC;
+        break;
+    case VAProfileAV1Profile0:
+        w = drv->nvencMaxWidthAV1; h = drv->nvencMaxHeightAV1;
+        break;
+    default:
+        break;
+    }
+
+    if (width != NULL)  *width  = w > 0 ? w : NVENC_FALLBACK_MAX_DIMENSION;
+    if (height != NULL) *height = h > 0 ? h : NVENC_FALLBACK_MAX_DIMENSION;
+}
+
 GUID nvenc_va_profile_to_codec_guid(VAProfile profile)
 {
     switch (profile) {
@@ -922,6 +975,31 @@ bool nvenc_probe_caps(NVDriver *drv)
             drv->nvencSupportsAV1_10bit = (cap != 0);
     }
 
+    /* 3b. Maximum encode dimensions, per codec. These are not uniform: H.264
+     * tops out at 4096 on current hardware while HEVC and AV1 go to 8192, so
+     * reporting one hardcoded number through VAConfigAttribMaxPictureWidth /
+     * Height either hides 8K HEVC/AV1 capability or promises H.264 sizes the
+     * encoder will reject at session init. */
+    struct { bool supported; GUID guid; uint32_t *w, *h; } dims[] = {
+        { drv->nvencSupportsH264, NV_ENC_CODEC_H264_GUID,
+          &drv->nvencMaxWidthH264, &drv->nvencMaxHeightH264 },
+        { drv->nvencSupportsHEVC, NV_ENC_CODEC_HEVC_GUID,
+          &drv->nvencMaxWidthHEVC, &drv->nvencMaxHeightHEVC },
+        { drv->nvencSupportsAV1,  NV_ENC_CODEC_AV1_GUID,
+          &drv->nvencMaxWidthAV1,  &drv->nvencMaxHeightAV1 },
+    };
+    for (size_t i = 0; i < sizeof(dims) / sizeof(dims[0]); i++) {
+        if (!dims[i].supported) continue;
+        int cap = 0;
+        if (nvenc_query_cap(&tmp.funcs, tmp.encoder, dims[i].guid,
+                            NV_ENC_CAPS_WIDTH_MAX, &cap) && cap > 0)
+            *dims[i].w = (uint32_t) cap;
+        cap = 0;
+        if (nvenc_query_cap(&tmp.funcs, tmp.encoder, dims[i].guid,
+                            NV_ENC_CAPS_HEIGHT_MAX, &cap) && cap > 0)
+            *dims[i].h = (uint32_t) cap;
+    }
+
     /* 4. Input formats — walk supported formats for each active codec to
      * populate the YUV444 / YUV444_10 / YUV422 / YUV422_10 flags. Format
      * support is codec-agnostic in NVENC's API but the cap query is per-
@@ -957,6 +1035,10 @@ bool nvenc_probe_caps(NVDriver *drv)
         drv->nvencSupportsAV1, drv->nvencSupportsAV1_10bit,
         drv->nvencSupportsInputYUV444, drv->nvencSupportsInputYUV444_10,
         drv->nvencSupportsInputYUV422, drv->nvencSupportsInputYUV422_10);
+    LOG("NVENC max encode size: H264=%ux%u HEVC=%ux%u AV1=%ux%u",
+        drv->nvencMaxWidthH264, drv->nvencMaxHeightH264,
+        drv->nvencMaxWidthHEVC, drv->nvencMaxHeightHEVC,
+        drv->nvencMaxWidthAV1,  drv->nvencMaxHeightAV1);
 
 done:
     nvenc_close_session(&tmp);

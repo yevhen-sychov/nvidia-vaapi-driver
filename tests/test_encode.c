@@ -1361,6 +1361,138 @@ cleanup:
     vaDestroyConfig(dpy, config);
 }
 
+/* --- Test: AV1 per-frame base_qindex actually reaches the encoder --- */
+
+/* Chromium runs AV1 encode in CQP mode (kEncodeConstantQuantizationParameter)
+ * and does rate control itself in software, pushing the result as
+ * VAEncPictureParameterBufferAV1::base_qindex on every frame. It sends no
+ * VAEncMiscParameterTypeRateControl for AV1 at all -- so base_qindex is the
+ * entire rate-control channel.
+ *
+ * The driver used to read only temporal_id out of that buffer and drop
+ * base_qindex on the floor, which meant the browser's bitrate target had no
+ * effect on the output whatsoever. This encodes the same moving content at a
+ * low qindex (high quality, large frames) and then a high one (low quality,
+ * small frames) and requires the coded sizes to respond. With the field
+ * ignored, both windows come out the same size and this fails. */
+static void test_av1_base_qindex_applied(void)
+{
+    TEST_START("AV1 base_qindex drives coded size (Chromium CQP path)");
+
+    VAConfigAttrib attribs[2] = {
+        { .type = VAConfigAttribRTFormat,    .value = VA_RT_FORMAT_YUV420 },
+        { .type = VAConfigAttribRateControl, .value = VA_RC_CQP },
+    };
+    VAConfigID config;
+    VAStatus st = vaCreateConfig(dpy, VAProfileAV1Profile0, VAEntrypointEncSlice,
+                                 attribs, 2, &config);
+    if (st != VA_STATUS_SUCCESS) { TEST_SKIP("AV1 encoding not supported"); return; }
+
+    const uint32_t W = 1280, H = 720;
+    VASurfaceID surface;
+    vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, W, H, &surface, 1, NULL, 0);
+    VAContextID context;
+    vaCreateContext(dpy, config, W, H, VA_PROGRESSIVE, &surface, 1, &context);
+    VABufferID coded;
+    vaCreateBuffer(dpy, context, VAEncCodedBufferType, W * H, 1, NULL, &coded);
+
+    VAImageFormat fmt = { .fourcc = VA_FOURCC_NV12 };
+    VAImage image;
+    vaCreateImage(dpy, &fmt, W, H, &image);
+
+    /* AV1 qindex is 0-255. Keep both values well inside the range and far
+     * apart so the comparison is not fighting quantiser granularity. */
+    const uint8_t LOW_QINDEX  = 60;   /* high quality -> big frames */
+    const uint8_t HIGH_QINDEX = 220;  /* low quality  -> small frames */
+    const int WARMUP = 4;
+    const int WINDOW = 16;
+
+    uint64_t lowQSum = 0, highQSum = 0;
+    int lowQSamples = 0, highQSamples = 0;
+    const int totalFrames = WARMUP + WINDOW + WINDOW;
+
+    for (int frame = 0; frame < totalFrames; frame++) {
+        fill_nv12_image_variable(&image, frame);
+        vaPutImage(dpy, surface, image.image_id, 0, 0, W, H, 0, 0, W, H);
+
+        const uint8_t qindex = (frame < WARMUP + WINDOW) ? LOW_QINDEX : HIGH_QINDEX;
+
+        VAEncSequenceParameterBufferAV1 seq = { .intra_period = 0 };
+        VAEncPictureParameterBufferAV1 pic = {
+            .coded_buf = coded,
+            .frame_width_minus_1 = (uint16_t)(W - 1),
+            .frame_height_minus_1 = (uint16_t)(H - 1),
+            .base_qindex = qindex,
+            .picture_flags.bits.frame_type = (frame == 0) ? 0 : 1,
+        };
+
+        VABufferID bufs[2];
+        vaCreateBuffer(dpy, context, VAEncSequenceParameterBufferType,
+                       sizeof(seq), 1, &seq, &bufs[0]);
+        vaCreateBuffer(dpy, context, VAEncPictureParameterBufferType,
+                       sizeof(pic), 1, &pic, &bufs[1]);
+
+        vaBeginPicture(dpy, context, surface);
+        vaRenderPicture(dpy, context, bufs, 2);
+        VAStatus est = vaEndPicture(dpy, context);
+        if (est != VA_STATUS_SUCCESS) {
+            TEST_FAIL("vaEndPicture failed");
+            for (int i = 0; i < 2; i++) vaDestroyBuffer(dpy, bufs[i]);
+            goto cleanup;
+        }
+
+        VACodedBufferSegment *seg;
+        vaMapBuffer(dpy, coded, (void **)&seg);
+        if (!seg || !seg->buf || seg->size == 0) {
+            TEST_FAIL("empty coded buffer");
+            vaUnmapBuffer(dpy, coded);
+            for (int i = 0; i < 2; i++) vaDestroyBuffer(dpy, bufs[i]);
+            goto cleanup;
+        }
+        if (frame >= WARMUP && frame < WARMUP + WINDOW) {
+            lowQSum += seg->size;
+            lowQSamples++;
+        } else if (frame >= WARMUP + WINDOW) {
+            highQSum += seg->size;
+            highQSamples++;
+        }
+        vaUnmapBuffer(dpy, coded);
+
+        for (int i = 0; i < 2; i++) vaDestroyBuffer(dpy, bufs[i]);
+    }
+
+    if (lowQSamples == 0 || highQSamples == 0) {
+        TEST_FAIL("no samples collected");
+        goto cleanup;
+    }
+
+    const double lowQAvg  = (double) lowQSum  / lowQSamples;   /* qindex 60  */
+    const double highQAvg = (double) highQSum / highQSamples;  /* qindex 220 */
+
+    /* A ~3.7x qindex increase should shrink frames by far more than 1.5x. The
+     * loose factor keeps this robust across NVENC preset/driver revisions while
+     * still failing hard if base_qindex is ignored, in which case the two
+     * averages are essentially identical. */
+    if (highQAvg > lowQAvg / 1.5) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "base_qindex ignored: qindex=%u avg=%.0f B vs qindex=%u avg=%.0f B "
+                 "(need high-qindex avg < low/1.5)",
+                 LOW_QINDEX, lowQAvg, HIGH_QINDEX, highQAvg);
+        TEST_FAIL(msg);
+        goto cleanup;
+    }
+
+    TEST_PASS();
+
+cleanup:
+    vaDestroyImage(dpy, image.image_id);
+    vaDestroyBuffer(dpy, coded);
+    vaDestroyContext(dpy, context);
+    vaDestroySurfaces(dpy, &surface, 1);
+    vaDestroyConfig(dpy, config);
+}
+
 /* --- Test: repeated bitrate changes each get applied --- */
 
 /* Chrome pushes a fresh rate-control misc-param on every single frame in the
@@ -1886,6 +2018,7 @@ int main(int argc, char **argv)
         test_av1_combined_rtformat_encode();
         test_av1_temporal_layers();
         test_av1_temporal_svc_encode();
+        test_av1_base_qindex_applied();
     }
 
     printf("\nStress:\n");

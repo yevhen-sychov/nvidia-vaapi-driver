@@ -8,9 +8,22 @@ void h264enc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     VAEncSequenceParameterBufferH264 *seq =
         (VAEncSequenceParameterBufferH264*) buffer->ptr;
 
-    LOG("H264 encode: seq params %ux%u, intra_period=%u, ip_period=%u",
-        seq->picture_width_in_mbs * 16, seq->picture_height_in_mbs * 16,
-        seq->intra_period, seq->ip_period);
+    /* Chromium resends the sequence parameters on every frame, so log only when
+     * they change — and only bother comparing if anyone is listening. */
+    if (LOG_ENABLED()) {
+        const NVENCSeqLog seqLog = {
+            .width = seq->picture_width_in_mbs * 16u,
+            .height = seq->picture_height_in_mbs * 16u,
+            .intraPeriod = seq->intra_period,
+            .ipPeriod = seq->ip_period,
+            .bitsPerSecond = seq->bits_per_second,
+        };
+        if (nvenc_log_state_changed(&nvencCtx->loggedSeq, &seqLog, sizeof(seqLog))) {
+            LOG("H264 encode: seq params %ux%u, intra_period=%u, ip_period=%u, bitrate=%u",
+                seqLog.width, seqLog.height, seqLog.intraPeriod, seqLog.ipPeriod,
+                seqLog.bitsPerSecond);
+        }
+    }
 
     /* Store basic sequence-level encode parameters */
     nvencCtx->width = seq->picture_width_in_mbs * 16;
@@ -97,10 +110,24 @@ void h264enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     case VAEncMiscParameterTypeRateControl: {
         VAEncMiscParameterRateControl *rc =
             (VAEncMiscParameterRateControl*) misc->data;
-        LOG("H264 encode: rate control bits_per_second=%u, target_percentage=%u, "
-            "qp{init=%u, min=%u, max=%u}",
-            rc->bits_per_second, rc->target_percentage,
-            rc->initial_qp, rc->min_qp, rc->max_qp);
+        /* WebRTC pushes a fresh rate-control buffer every frame; only the
+         * changes are interesting. What was actually programmed into NVENC is
+         * logged separately by nvenc_reconfigure_if_needed(). */
+        if (LOG_ENABLED()) {
+            const NVENCRateLog rateLog = {
+                .bitsPerSecond = rc->bits_per_second,
+                .targetPercentage = rc->target_percentage,
+                .initialQP = rc->initial_qp,
+                .minQP = rc->min_qp,
+                .maxQP = rc->max_qp,
+            };
+            if (nvenc_log_state_changed(&nvencCtx->loggedRate, &rateLog, sizeof(rateLog))) {
+                LOG("H264 encode: rate control bits_per_second=%u, target_percentage=%u, "
+                    "qp{init=%u, min=%u, max=%u}",
+                    rc->bits_per_second, rc->target_percentage,
+                    rc->initial_qp, rc->min_qp, rc->max_qp);
+            }
+        }
         if (rc->bits_per_second > 0) {
             nvencCtx->maxBitrate = rc->bits_per_second;
             if (rc->target_percentage > 0) {
@@ -124,7 +151,12 @@ void h264enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
             if (den == 0) den = 1;
             nvencCtx->frameRateNum = num;
             nvencCtx->frameRateDen = den;
-            LOG("H264 encode: framerate %u/%u", num, den);
+            if (LOG_ENABLED()) {
+                const NVENCFrameRateLog frLog = { .num = num, .den = den };
+                if (nvenc_log_state_changed(&nvencCtx->loggedFrameRate, &frLog, sizeof(frLog))) {
+                    LOG("H264 encode: framerate %u/%u", num, den);
+                }
+            }
         }
         break;
     }

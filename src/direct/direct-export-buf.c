@@ -919,7 +919,7 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
 
     nvBackingImageStoreSurfaceColorMetadata(surface->backingImage, surface);
 
-    desc->fourcc = fmtInfo->fourcc;
+    desc->fourcc = nvExportableFourcc(fmtInfo->fourcc);
     desc->width = surface->width;
     desc->height = surface->height;
 
@@ -969,6 +969,25 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
     LOG_DEBUG("Exporting surface descriptor: fourcc=0x%x, size=%ux%u, layers=%u",
         desc->fourcc, desc->width, desc->height, desc->num_layers);
 
+    /* A VADRMPRIMESurfaceDescriptor carries one modifier per *object*, so a
+     * surface whose planes ended up with different block-linear modifiers is
+     * simply not representable: folding them into one object (SINGLE/COMBINED)
+     * describes chroma with luma's tiling, and splitting them into one object
+     * per plane (MULTI) trips Chromium's CHECK_EQ on uniform modifiers and
+     * aborts its GPU process. We advertise MIN_EXPORTABLE_SURFACE_HEIGHT so
+     * clients never allocate into that regime — this only fires if something
+     * created a surface below the advertised minimum anyway, in which case a
+     * loud log beats silent green macroblocks. */
+    for (uint32_t i = 1; i < fmtInfo->numPlanes; i++) {
+        if (img->mods[i] != img->mods[0]) {
+            LOG("WARNING: surface %ux%u plane %u modifier 0x%llx differs from plane 0 modifier 0x%llx"
+                " — this surface is below the exportable height floor and will render incorrectly",
+                surface->width, surface->height, i,
+                (unsigned long long) img->mods[i], (unsigned long long) img->mods[0]);
+            break;
+        }
+    }
+
     nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS);
     if (img->isSingleBuffer) {
         nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS_SINGLE);
@@ -978,7 +997,7 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
         desc->objects[0].drm_format_modifier = img->mods[0];
 
         if (combinedLayer) {
-            desc->layers[0].drm_format = fmtInfo->fourcc;
+            desc->layers[0].drm_format = nvExportableFourcc(fmtInfo->fourcc);
             desc->layers[0].num_planes = fmtInfo->numPlanes;
             for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
                 desc->layers[0].object_index[i] = 0;

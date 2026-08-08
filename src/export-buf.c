@@ -612,7 +612,7 @@ static bool egl_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRMPRI
     int bpp = img->fourcc == DRM_FORMAT_NV12 ? 1 : 2;
 
     //TODO only support 420 images (either NV12, P010 or P012)
-    desc->fourcc = img->fourcc;
+    desc->fourcc = nvExportableFourcc(img->fourcc);
     desc->width = img->width;
     desc->height = img->height;
     desc->num_layers = 2;

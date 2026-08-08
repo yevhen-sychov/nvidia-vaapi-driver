@@ -22,6 +22,7 @@
 static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx);
 
 void nvGetConfigAttributesEncode(
+        NVDriver *drv,
         VAProfile profile,
         VAConfigAttrib *attrib_list,
         int num_attribs
@@ -78,12 +79,31 @@ void nvGetConfigAttributesEncode(
             break;
         }
         case VAConfigAttribEncPackedHeaders:
-            //accept all packed header types; NVENC generates its own but
-            //apps (Steam) expect the driver to accept them without warning
+            /* NVENC authors its own SPS/PPS/VPS and slice headers; there is no
+             * API to hand it a client-built slice header, and the bitstream it
+             * emits is self-consistent. So what we advertise here is not "which
+             * headers can you give us" but "which headers will the client stop
+             * building itself".
+             *
+             * Deliberately NOT advertising SLICE (or PICTURE): Chromium's
+             * H264VaapiVideoEncoderDelegate treats packed headers as
+             * all-or-nothing — if SEQUENCE|PICTURE|SLICE are not all present it
+             * configures the context with VA_ENC_PACKED_HEADER_NONE and sends
+             * no headers at all, leaving the driver to author them. That is
+             * exactly the arrangement that matches NVENC. Advertising the full
+             * set instead made Chromium build SPS/PPS and per-slice headers
+             * (with has_emulation_bytes = 0, expecting us to insert emulation
+             * prevention) that we then silently discarded — wasted work, and a
+             * standing risk that its frame_num/ref-list assumptions diverge
+             * from the headers NVENC actually wrote.
+             *
+             * RAW_DATA is advertised because GStreamer gates SEI/AUD insertion
+             * on it, and MISC because FFmpeg gates SEI/AUD/metadata on that.
+             * Both tolerate the missing SLICE bit: they simply skip the packed
+             * slice header and let the driver produce it. */
             attrib_list[i].value = VA_ENC_PACKED_HEADER_SEQUENCE
-                                 | VA_ENC_PACKED_HEADER_PICTURE
-                                 | VA_ENC_PACKED_HEADER_SLICE
-                                 | VA_ENC_PACKED_HEADER_MISC;
+                                 | VA_ENC_PACKED_HEADER_MISC
+                                 | VA_ENC_PACKED_HEADER_RAW_DATA;
             break;
         case VAConfigAttribEncMaxRefFrames:
             /* Disable B-frames for all codecs for now to ensure 1:1 mapping and no reordering issues.
@@ -92,10 +112,10 @@ void nvGetConfigAttributesEncode(
             attrib_list[i].value = 1; /* 1 L0, 0 L1 */
             break;
         case VAConfigAttribMaxPictureWidth:
-            attrib_list[i].value = 4096;
+            nvenc_max_encode_dimensions(drv, profile, &attrib_list[i].value, NULL);
             break;
         case VAConfigAttribMaxPictureHeight:
-            attrib_list[i].value = 4096;
+            nvenc_max_encode_dimensions(drv, profile, NULL, &attrib_list[i].value);
             break;
         case VAConfigAttribEncQualityRange:
             attrib_list[i].value = 7; //NVENC presets P1-P7
@@ -249,7 +269,18 @@ void nvRenderPictureEncode(NVContext *nvCtx, NVBuffer *buf)
         break;
     case VAEncPackedHeaderParameterBufferType:
     case VAEncPackedHeaderDataBufferType:
-        /* Packed headers: NVENC generates its own headers, skip these */
+        /* Packed headers: NVENC generates its own headers, skip these.
+         * See VAConfigAttribEncPackedHeaders in nvGetConfigAttributesEncode()
+         * for why we no longer advertise SLICE/PICTURE, which keeps well-behaved
+         * clients from building these in the first place. */
+        break;
+    case VAEncMacroblockMapBufferType:
+        /* AV1 segmentation map. Chromium's AV1 encoder delegate submits one
+         * every frame. NVENC exposes no per-block AV1 segment map through the
+         * public API (only a whole-frame QP delta map, which is a different
+         * thing), so there is nothing to apply — accept it silently rather than
+         * logging once per frame for the life of the stream. Rate control still
+         * works: it arrives through base_qindex, which we do honour. */
         break;
     default:
         LOG("Encode: unhandled buffer type: %d", buf->bufferType);
@@ -333,9 +364,24 @@ VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx)
     uint32_t copyWidth = (surfWidth < encWidth) ? surfWidth : encWidth;
     uint32_t copyHeight = (surfHeight < encHeight) ? surfHeight : encHeight;
 
-    LOG("Encode: surface %ux%u (format %d, bitDepth %d), encoder %ux%u (format %d), copy %ux%u",
-        surfWidth, surfHeight, img->format, surface->bitDepth,
-        encWidth, encHeight, encFmt, copyWidth, copyHeight);
+    /* Only log when the geometry actually changes — this runs on every frame,
+     * and for a steady stream it prints the same line forever. Behind
+     * LOG_ENABLED() so a build with logging off does none of this work. */
+    if (LOG_ENABLED()) {
+        const NVENCGeometryLog geometry = {
+            .surfWidth = surfWidth, .surfHeight = surfHeight,
+            .encWidth = encWidth, .encHeight = encHeight,
+            .copyWidth = copyWidth, .copyHeight = copyHeight,
+            .imgFormat = (int32_t) img->format,
+            .bitDepth = (int32_t) surface->bitDepth,
+            .encFormat = (int32_t) encFmt,
+        };
+        if (nvenc_log_state_changed(&nvencCtx->loggedGeometry, &geometry, sizeof(geometry))) {
+            LOG("Encode: surface %ux%u (format %d, bitDepth %d), encoder %ux%u (format %d), copy %ux%u",
+                surfWidth, surfHeight, img->format, surface->bitDepth,
+                encWidth, encHeight, encFmt, copyWidth, copyHeight);
+        }
+    }
 
     /* Calculate pitch and size for NV12/P010 linear buffer.
      * Allocate for the full encode height (may be larger than surface due to alignment)
@@ -474,8 +520,8 @@ VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx)
             coded->bitstreamSize = 0;
             coded->hasData = false;
         }
-        LOG("Encode: frame %lu buffered (needs more input)",
-            (unsigned long)(nvencCtx->frameCount - 1));
+        LOG_DEBUG("Encode: frame %lu buffered (needs more input)",
+                  (unsigned long)(nvencCtx->frameCount - 1));
         CHECK_CUDA_RESULT_RETURN(drv->cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
         return VA_STATUS_SUCCESS;
     }
@@ -506,8 +552,11 @@ VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx)
         memcpy(coded->bitstreamData, bitstreamPtr, bitstreamSize);
         coded->bitstreamSize = bitstreamSize;
         coded->hasData = true;
-        LOG("Encode: frame %lu encoded, %u bytes",
-            (unsigned long)(nvencCtx->frameCount - 1), bitstreamSize);
+        /* Pure per-frame progress: the size differs every frame, so there is no
+         * "changed" state to key off and nothing actionable in a steady stream.
+         * Available under NVD_LOG_VERBOSE=1; NVD_STATS=1 gives throughput. */
+        LOG_DEBUG("Encode: frame %lu encoded, %u bytes",
+                  (unsigned long)(nvencCtx->frameCount - 1), bitstreamSize);
     } else {
         LOG("Encode: WARNING - no coded buffer found for id %d", nvencCtx->currentCodedBufId);
     }

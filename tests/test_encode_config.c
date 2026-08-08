@@ -149,13 +149,36 @@ static void test_config_ratecontrol(void) {
     TEST_PASS();
 }
 
+/* NVENC authors its own SPS/PPS/VPS and slice headers and offers no way to
+ * inject a client-built slice header, so what this attribute advertises is
+ * really "which headers will the client stop building itself".
+ *
+ * The SLICE bit must stay clear. Chromium's H264VaapiVideoEncoderDelegate
+ * treats packed headers as all-or-nothing: only if SEQUENCE|PICTURE|SLICE are
+ * all advertised does it build them, and it then expects the driver to use
+ * them. Since we cannot, the incomplete set is what makes Chromium configure
+ * VA_ENC_PACKED_HEADER_NONE and leave header authoring to the driver — which is
+ * what NVENC actually does. FFmpeg and GStreamer both tolerate the missing bit
+ * and fall back to driver-authored headers too; they only need MISC / RAW_DATA
+ * to gate SEI and AUD insertion. */
 static void test_config_packed_headers(void) {
-    TEST_START("Packed headers: SEQ + PIC advertised");
+    TEST_START("Packed headers: SEQ + MISC + RAW_DATA, no SLICE/PICTURE");
     VAConfigAttrib a = { .type = VAConfigAttribEncPackedHeaders };
     EXPECT_STATUS(vaGetConfigAttributes(g_dpy, VAProfileH264High,
                                          VAEntrypointEncSlice, &a, 1));
     EXPECT_TRUE(a.value & VA_ENC_PACKED_HEADER_SEQUENCE, "no SEQ");
-    EXPECT_TRUE(a.value & VA_ENC_PACKED_HEADER_PICTURE, "no PIC");
+    EXPECT_TRUE(a.value & VA_ENC_PACKED_HEADER_MISC, "no MISC (FFmpeg SEI/AUD gate)");
+    EXPECT_TRUE(a.value & VA_ENC_PACKED_HEADER_RAW_DATA,
+                "no RAW_DATA (GStreamer SEI/AUD gate)");
+
+    const unsigned chromiumAllOrNothing = VA_ENC_PACKED_HEADER_SEQUENCE
+                                        | VA_ENC_PACKED_HEADER_PICTURE
+                                        | VA_ENC_PACKED_HEADER_SLICE;
+    EXPECT_TRUE((a.value & chromiumAllOrNothing) != chromiumAllOrNothing,
+                "SEQ|PIC|SLICE all advertised — Chromium would build packed "
+                "headers that NVENC then ignores");
+    EXPECT_TRUE(!(a.value & VA_ENC_PACKED_HEADER_SLICE),
+                "SLICE advertised but NVENC cannot accept a client slice header");
     TEST_PASS();
 }
 
@@ -193,6 +216,131 @@ static void test_config_max_dimensions(void) {
     EXPECT_TRUE(a[0].value >= 4096, "Width too small");
     EXPECT_TRUE(a[1].value != VA_ATTRIB_NOT_SUPPORTED, "Height unsupported");
     EXPECT_TRUE(a[1].value >= 4096, "Height too small");
+    TEST_PASS();
+}
+
+/* Max encode dimensions are per-codec, not one global number: H.264 tops out at
+ * 4096 on current hardware while HEVC and AV1 reach 8192. The driver used to
+ * report a hardcoded 4096 for everything, which hid half of each axis of 8K
+ * HEVC/AV1 capability. */
+static void test_config_max_dimensions_are_per_codec(void) {
+    TEST_START("Max dimensions come from NVENC caps, not a constant");
+
+    struct { VAProfile profile; const char *name; } codecs[] = {
+        { VAProfileHEVCMain,   "HEVC Main" },
+        { VAProfileAV1Profile0, "AV1 P0"   },
+    };
+
+    bool sawAny = false;
+    for (unsigned i = 0; i < sizeof(codecs) / sizeof(codecs[0]); i++) {
+        if (!test_has_entrypoint(g_dpy, codecs[i].profile, VAEntrypointEncSlice))
+            continue;
+        sawAny = true;
+
+        VAConfigAttrib a[2] = {
+            { .type = VAConfigAttribMaxPictureWidth },
+            { .type = VAConfigAttribMaxPictureHeight },
+        };
+        EXPECT_STATUS(vaGetConfigAttributes(g_dpy, codecs[i].profile,
+                                            VAEntrypointEncSlice, a, 2));
+        EXPECT_TRUE(a[0].value != VA_ATTRIB_NOT_SUPPORTED, "width unsupported");
+        EXPECT_TRUE(a[1].value != VA_ATTRIB_NOT_SUPPORTED, "height unsupported");
+        /* Every NVENC generation that implements HEVC/AV1 does at least 4K;
+         * anything less means we failed to read the cap and fell back wrongly. */
+        EXPECT_TRUE(a[0].value >= 4096 && a[1].value >= 4096,
+                    "HEVC/AV1 max encode size below 4096");
+    }
+
+    if (!sawAny) {
+        TEST_SKIP("neither HEVC nor AV1 encode available");
+        return;
+    }
+    TEST_PASS();
+}
+
+/* Chromium and GStreamer both enumerate profiles via vaQueryConfigProfiles and
+ * only then ask for entrypoints, so a profile missing from that list is
+ * unreachable regardless of what the entrypoint query would return. The profile
+ * list is built from the NVDEC decode probe, so anything NVENC can encode but
+ * NVDEC cannot decode has to be unioned in explicitly — H.264 High10 has no
+ * decode branch at all, and HEVC Main422_10 decode is compiled out because
+ * NVDEC has no 4:2:2 support. */
+static void test_encode_only_profiles_are_enumerated(void) {
+    TEST_START("Encode-only profiles appear in vaQueryConfigProfiles");
+
+    int maxProfiles = vaMaxNumProfiles(g_dpy);
+    VAProfile *profiles = calloc(maxProfiles, sizeof(VAProfile));
+    int numProfiles = 0;
+    EXPECT_STATUS(vaQueryConfigProfiles(g_dpy, profiles, &numProfiles));
+
+    /* Only assert reachability for profiles the hardware actually encodes —
+     * ask the entrypoint query, which is not gated on the decode probe. */
+    const VAProfile candidates[] = { VAProfileH264High10, VAProfileHEVCMain422_10 };
+    for (unsigned i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (!test_has_entrypoint(g_dpy, candidates[i], VAEntrypointEncSlice))
+            continue; /* not supported by this GPU — nothing to enumerate */
+
+        bool listed = false;
+        for (int j = 0; j < numProfiles; j++) {
+            if (profiles[j] == candidates[i]) { listed = true; break; }
+        }
+        if (!listed) {
+            char msg[144];
+            snprintf(msg, sizeof(msg),
+                     "profile %d encodes but is absent from vaQueryConfigProfiles "
+                     "— unreachable from Chromium/GStreamer", candidates[i]);
+            free(profiles);
+            TEST_FAIL(msg);
+            return;
+        }
+    }
+    free(profiles);
+    TEST_PASS();
+}
+
+/* HEVC Main10 and AV1 Profile0 accept both 8-bit and 10-bit input. Reporting a
+ * single pixel format keyed off the config's bit depth hid the other one from
+ * clients that enumerate surface formats before deciding what to feed. */
+static void test_dual_depth_profiles_report_both_formats(void) {
+    TEST_START("10-bit-capable encode profiles list NV12 and P010");
+
+    if (!test_has_entrypoint(g_dpy, VAProfileAV1Profile0, VAEntrypointEncSlice)) {
+        TEST_SKIP("AV1 encode unavailable");
+        return;
+    }
+
+    VAConfigAttrib attr = { .type = VAConfigAttribRTFormat,
+                            .value = VA_RT_FORMAT_YUV420 };
+    VAConfigID config;
+    EXPECT_STATUS(vaCreateConfig(g_dpy, VAProfileAV1Profile0, VAEntrypointEncSlice,
+                                 &attr, 1, &config));
+
+    unsigned int num = 0;
+    VAStatus st = vaQuerySurfaceAttributes(g_dpy, config, NULL, &num);
+    if (st != VA_STATUS_SUCCESS || num == 0) {
+        vaDestroyConfig(g_dpy, config);
+        TEST_FAIL("vaQuerySurfaceAttributes returned nothing for an encode config");
+        return;
+    }
+    VASurfaceAttrib *attribs = calloc(num, sizeof(*attribs));
+    st = vaQuerySurfaceAttributes(g_dpy, config, attribs, &num);
+    vaDestroyConfig(g_dpy, config);
+    if (st != VA_STATUS_SUCCESS) {
+        free(attribs);
+        EXPECT_STATUS(st);
+        return;
+    }
+
+    bool sawNV12 = false, sawP010 = false;
+    for (unsigned i = 0; i < num; i++) {
+        if (attribs[i].type != VASurfaceAttribPixelFormat) continue;
+        if (attribs[i].value.value.i == (int) VA_FOURCC_NV12) sawNV12 = true;
+        if (attribs[i].value.value.i == (int) VA_FOURCC_P010) sawP010 = true;
+    }
+    free(attribs);
+
+    EXPECT_TRUE(sawNV12, "AV1 encode config does not list NV12");
+    EXPECT_TRUE(sawP010, "AV1 encode config does not list P010");
     TEST_PASS();
 }
 
@@ -494,6 +642,9 @@ int main(void)
     test_config_max_ref_frames();
     test_av1_max_ref_frames();
     test_config_max_dimensions();
+    test_config_max_dimensions_are_per_codec();
+    test_encode_only_profiles_are_enumerated();
+    test_dual_depth_profiles_report_both_formats();
     test_config_quality_range();
 
     printf("\nError paths:\n");

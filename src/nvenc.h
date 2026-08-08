@@ -19,6 +19,37 @@ typedef struct {
     bool                    locked;
 } NVENCOutputBuffer;
 
+/*
+ * Snapshots of what the chatty per-frame log sites last printed.
+ *
+ * The encode path re-runs the whole parameter plumbing on every single frame —
+ * Chromium resends the sequence, picture and misc parameter buffers each time —
+ * so logging any of it unconditionally produces two to four lines per frame and
+ * buries everything that actually matters. At 4K60 that is hundreds of lines a
+ * second saying the same thing.
+ *
+ * Each site keeps the values it last emitted here and only logs when they
+ * differ, so a steady stream is silent and a genuine change (resolution,
+ * bitrate, framerate, QP bounds) still stands out. Zero-initialised with the
+ * context, so the first frame always logs.
+ */
+typedef struct {
+    uint32_t width, height, intraPeriod, ipPeriod, bitsPerSecond;
+} NVENCSeqLog;
+
+typedef struct {
+    uint32_t bitsPerSecond, targetPercentage, initialQP, minQP, maxQP;
+} NVENCRateLog;
+
+typedef struct {
+    uint32_t num, den;
+} NVENCFrameRateLog;
+
+typedef struct {
+    uint32_t surfWidth, surfHeight, encWidth, encHeight, copyWidth, copyHeight;
+    int32_t  imgFormat, bitDepth, encFormat;
+} NVENCGeometryLog;
+
 typedef struct {
     void                           *encoder;        //NVENC session handle
     NV_ENCODE_API_FUNCTION_LIST     funcs;
@@ -97,6 +128,12 @@ typedef struct {
     /* Last CONSTQP value actually programmed via init/reconfigure; used to
      * detect per-picture QP changes and issue nvEncReconfigureEncoder. */
     uint32_t                        appliedConstQP;
+    /* See the NVENC*Log typedefs above: last values emitted by the per-frame
+     * log sites, so each one only logs on change. */
+    NVENCSeqLog                     loggedSeq;
+    NVENCRateLog                    loggedRate;
+    NVENCFrameRateLog               loggedFrameRate;
+    NVENCGeometryLog                loggedGeometry;
 } NVENCContext;
 
 // Wraps VACodedBufferSegment with NVENC bitstream storage
@@ -107,6 +144,13 @@ typedef struct {
     uint32_t                bitstreamAlloc;
     bool                    hasData;
 } NVCodedBuffer;
+
+/*
+ * Returns true, and stores `now` into `last`, if the two differ. Used by the
+ * per-frame encode log sites so they only emit a line when something actually
+ * changed — see the NVENC*Log typedefs above.
+ */
+bool nvenc_log_state_changed(void *last, const void *now, size_t size);
 
 bool nvenc_load(NvencFunctions **nvenc_dl);
 void nvenc_unload(NvencFunctions **nvenc_dl);
@@ -181,6 +225,15 @@ bool nvenc_is_encode_profile(VAProfile profile);
  * IPC-only builds.
  */
 bool nvenc_is_encode_profile_supported(struct _NVDriver *drv, VAProfile profile);
+
+/* Conservative encode dimension limit used when the caps probe could not run
+ * (IPC-only builds have no CUDA context to open a scratch session with). Every
+ * NVENC generation supports at least 4K for every codec it implements. */
+#define NVENC_FALLBACK_MAX_DIMENSION 4096
+
+/* Largest frame the encoder accepts for `profile`. Either pointer may be NULL. */
+void nvenc_max_encode_dimensions(struct _NVDriver *drv, VAProfile profile,
+                                 uint32_t *width, uint32_t *height);
 GUID nvenc_va_profile_to_codec_guid(VAProfile profile);
 GUID nvenc_va_profile_to_profile_guid(VAProfile profile);
 /*
@@ -202,7 +255,7 @@ NV_ENC_BUFFER_FORMAT nvenc_surface_format(VAProfile profile, int bitDepth);
  * VA config attribute query targets an encode profile (nvGetConfigAttributesEncode)
  * or the active context is an encode context (nvRenderPictureEncode / nvEndPictureEncode).
  */
-void nvGetConfigAttributesEncode(VAProfile profile,
+void nvGetConfigAttributesEncode(struct _NVDriver *drv, VAProfile profile,
                                  VAConfigAttrib *attrib_list,
                                  int num_attribs);
 void nvRenderPictureEncode(NVContext *nvCtx, NVBuffer *buf);

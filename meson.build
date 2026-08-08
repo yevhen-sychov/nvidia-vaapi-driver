@@ -147,6 +147,22 @@ if not meson.is_cross_build()
         dependencies : libva_test_deps, install : false)
     test('descriptor_mode', test_descriptor_mode, timeout : 60, env : test_env)
 
+    # Low-level VA-API contracts that Chromium/Firefox/FFmpeg depend on --
+    # easy to break while refactoring, and they fail downstream in confusing
+    # ways (silent software fallback, or a browser-side abort) rather than here.
+    # VideoProc blit geometry. Chromium's VaapiImageProcessorBackend asks for
+    # NV12->ARGB with a source rectangle and a different output size whenever
+    # the decoded surface cannot be imported into EGL directly; rejecting those
+    # requests drops the whole stream to software decode.
+    test_vpp = executable('test_vpp', 'tests/test_vpp.c',
+        dependencies : libva_test_deps, install : false)
+    test('vpp', test_vpp, timeout : 60, env : test_env)
+
+    test_client_contracts = executable('test_client_contracts',
+        'tests/test_client_contracts.c',
+        dependencies : libva_test_deps, install : false)
+    test('client_contracts', test_client_contracts, timeout : 60, env : test_env)
+
     test_concurrent = executable('test_concurrent_sessions',
         'tests/test_concurrent_sessions.c',
         dependencies : libva_test_deps + [dependency('threads')],
@@ -164,6 +180,20 @@ if not meson.is_cross_build()
     })
     test('descriptor_mode_self_preview_optin', test_descriptor_mode,
          timeout : 60, env : test_env_selfpreview)
+
+    # MULTI is the only layout that exports one DMA-BUF object per plane, so
+    # it is the only one that can surface a per-plane block-linear modifier
+    # split to the client. Re-run the suite there to keep Chromium's
+    # uniform-modifier CHECK covered on that path.
+    test_env_multi = environment({
+        'NVD_LOG': '1',
+        'LIBVA_DRIVER_NAME': 'nvidia',
+        'LIBVA_DRIVERS_PATH': meson.project_build_root(),
+        'LD_LIBRARY_PATH': meson.project_build_root(),
+        'NVD_DESCRIPTOR_MODE': 'multi',
+    })
+    test('descriptor_mode_multi', test_descriptor_mode,
+         timeout : 60, env : test_env_multi)
 
     gst_launch = find_program('gst-launch-1.0', required : false)
     if gst_launch.found()
@@ -191,6 +221,30 @@ if not meson.is_cross_build()
              args: [meson.current_source_dir() + '/samples/smptebars_h264.mp4'],
              timeout : 180,
              env : test_env,
+             is_parallel : false)
+
+        # VP8 decode correctness. VA-API hands the driver slice data that
+        # starts *after* the VP8 uncompressed data chunk, which NVDEC still
+        # needs, so the driver has to reconstruct it. Compares a hardware
+        # decode against libvpx and requires them to agree; generates its
+        # own fixture (there is no checked-in VP8 sample).
+        test('vp8_decode',
+             find_program('tests/test_vp8_decode.sh'),
+             timeout : 120,
+             env : test_env)
+
+        # The encode log must stay bounded by session setup rather than
+        # growing with frame count -- per-frame chatter buries the events
+        # that matter (resolution/bitrate changes, reconfigures, errors).
+        # Sets NVD_LOG itself, so it does not inherit test_env's NVD_LOG=1.
+        test('log_verbosity',
+             find_program('tests/test_log_verbosity.sh'),
+             timeout : 120,
+             env : {
+                 'LIBVA_DRIVER_NAME': 'nvidia',
+                 'LIBVA_DRIVERS_PATH': meson.project_build_root(),
+                 'LD_LIBRARY_PATH': meson.project_build_root(),
+             },
              is_parallel : false)
     endif
 endif

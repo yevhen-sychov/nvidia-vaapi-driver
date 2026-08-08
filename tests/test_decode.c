@@ -31,6 +31,10 @@ static int fail_count = 0;
     if (!(cond)) { TEST_FAIL(reason); return; } \
 } while (0)
 
+#define TEST_SKIP(reason) do { \
+    printf("\033[33mSKIP\033[0m (%s)\n", reason); \
+} while (0)
+
 static VADisplay dpy;
 static int drm_fd;
 
@@ -332,17 +336,139 @@ static void test_decode_auto_mode_split_for_all_decodes(void)
     TEST_PASS();
 }
 
+/* Regression test for upstream issue #397: vaBeginPicture eventually failing
+ * with VA_STATUS_ERROR_MAX_NUM_EXCEEDED ("list argument exceeds maximum
+ * number"), reported only under Chromium.
+ *
+ * Each surface that a context decodes into is given a picture index, which is
+ * what NVDEC uses to address its decode surface array. That index used to come
+ * from a counter that only ever incremented and was never released when the
+ * surface was destroyed — so a context could service at most `surfaceCount`
+ * *distinct surfaces over its whole lifetime*, not that many concurrently.
+ *
+ * FFmpeg hides this because it passes its whole surface pool as render targets
+ * up front and then reuses it. Chromium calls vaCreateContext with zero render
+ * targets (so the limit defaults to 32) and allocates surfaces on demand from a
+ * DmabufVideoFramePool that churns them across resolution changes and pool
+ * resizes. Once 32 distinct surfaces had passed through, every new one failed.
+ *
+ * This creates and destroys far more than 32 surfaces on a single context, one
+ * at a time, so at most one is ever live. */
+static void test_picture_index_is_recycled(void)
+{
+    TEST_START("Picture indices are recycled across surface churn (#397)");
+
+    VAConfigID config_id;
+    VAConfigAttrib rt_attr = { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 };
+    VAStatus st = vaCreateConfig(dpy, VAProfileH264High, VAEntrypointVLD, &rt_attr, 1, &config_id);
+    if (st != VA_STATUS_SUCCESS) { TEST_SKIP("H264 decode unavailable"); return; }
+
+    /* Zero render targets, exactly as Chromium does. */
+    VAContextID context_id;
+    st = vaCreateContext(dpy, config_id, 1920, 1080, VA_PROGRESSIVE, NULL, 0, &context_id);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateContext failed");
+
+    const int ITERATIONS = 96; /* 3x the 32-index budget */
+    for (int i = 0; i < ITERATIONS; i++) {
+        VASurfaceID surface;
+        st = vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, 1920, 1080, &surface, 1, NULL, 0);
+        if (st != VA_STATUS_SUCCESS) {
+            vaDestroyContext(dpy, context_id);
+            vaDestroyConfig(dpy, config_id);
+            TEST_FAIL("vaCreateSurfaces failed mid-loop");
+            return;
+        }
+
+        st = vaBeginPicture(dpy, context_id, surface);
+        if (st != VA_STATUS_SUCCESS) {
+            char msg[144];
+            snprintf(msg, sizeof(msg),
+                     "vaBeginPicture failed on surface %d/%d with status %d%s",
+                     i + 1, ITERATIONS, st,
+                     st == VA_STATUS_ERROR_MAX_NUM_EXCEEDED
+                         ? " (MAX_NUM_EXCEEDED — picture index leak)" : "");
+            vaDestroySurfaces(dpy, &surface, 1);
+            vaDestroyContext(dpy, context_id);
+            vaDestroyConfig(dpy, config_id);
+            TEST_FAIL(msg);
+            return;
+        }
+        /* No buffers are submitted, so vaEndPicture has nothing valid to decode;
+         * its status is not what is under test here. Call it to keep the
+         * context's per-picture state balanced. */
+        vaEndPicture(dpy, context_id);
+        vaDestroySurfaces(dpy, &surface, 1);
+    }
+
+    vaDestroyContext(dpy, context_id);
+    vaDestroyConfig(dpy, config_id);
+    TEST_PASS();
+}
+
+/* Surfaces hold a raw back-pointer to the context they were last used on, and
+ * VA-API does not require a client to destroy its surfaces before the context.
+ * If that back-pointer is left dangling, anything that later reads it —
+ * vaSyncSurface checking whether the context is an encode context, vaGetImage,
+ * the VideoProc blit, picture-index release on vaDestroySurfaces — touches
+ * freed memory. That fails intermittently, depending on whether the allocator
+ * has handed the block out again, which is exactly the kind of bug that only
+ * shows up under parallel test load.
+ *
+ * This destroys the context first and then uses the surfaces, in the order a
+ * client is entitled to. */
+static void test_surface_outlives_its_context(void)
+{
+    TEST_START("Surfaces stay usable after their context is destroyed");
+
+    VAConfigID config_id;
+    VAConfigAttrib rt_attr = { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 };
+    VAStatus st = vaCreateConfig(dpy, VAProfileH264High, VAEntrypointVLD, &rt_attr, 1, &config_id);
+    if (st != VA_STATUS_SUCCESS) { TEST_SKIP("H264 decode unavailable"); return; }
+
+    VAContextID context_id;
+    st = vaCreateContext(dpy, config_id, 1920, 1080, VA_PROGRESSIVE, NULL, 0, &context_id);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateContext failed");
+
+    enum { N = 8 };
+    VASurfaceID surfaces[N];
+    st = vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, 1920, 1080, surfaces, N, NULL, 0);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateSurfaces failed");
+
+    /* Bind each surface to the context so it takes a picture index and a
+     * context back-pointer. */
+    for (int i = 0; i < N; i++) {
+        if (vaBeginPicture(dpy, context_id, surfaces[i]) == VA_STATUS_SUCCESS) {
+            vaEndPicture(dpy, context_id);
+        }
+    }
+
+    /* Context first, surfaces after — the order that used to leave a dangling
+     * pointer behind. */
+    vaDestroyContext(dpy, context_id);
+
+    for (int i = 0; i < N; i++) {
+        vaSyncSurface(dpy, surfaces[i]);  /* reads surface->context */
+    }
+
+    st = vaDestroySurfaces(dpy, surfaces, N);
+    vaDestroyConfig(dpy, config_id);
+    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaDestroySurfaces after context teardown");
+    TEST_PASS();
+}
+
 int main()
 {
     printf("\n=== nvidia-vaapi-driver decoding tests ===\n\n");
     setup();
-    
+
     test_av1_decode_init();
     test_av1_decode_init_10bit();
     test_av1_decode_combined_rtformat();
     test_av1_decode_export();
     test_av1_decode_combined_descriptor_mode();
     test_decode_auto_mode_split_for_all_decodes();
+    test_picture_index_is_recycled();
+    test_surface_outlives_its_context();
 
     teardown();
     printf("\n=== Results: %d passed, %d failed ===\n\n", pass_count, fail_count);
