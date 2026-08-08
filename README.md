@@ -18,7 +18,12 @@ including the Steam Remote Play integration path. Everything below labelled as
 - [Table of contents](#table-of-contents)
 - [Codec Support](#codec-support)
   - [Decode Support](#decode-support)
+    - [VP8 bitstream reconstruction](#vp8-bitstream-reconstruction)
+    - [Picture-index recycling (upstream #397)](#picture-index-recycling-upstream-397)
+    - [Surface / context destruction order](#surface--context-destruction-order)
   - [Encode Support](#encode-support)
+    - [Packed headers](#packed-headers)
+    - [Encode logging](#encode-logging)
     - [Rate control](#rate-control)
     - [Format-plumbing status for the newer profiles](#format-plumbing-status-for-the-newer-profiles)
     - [Live rate-control / framerate updates (WebRTC BWE)](#live-rate-control--framerate-updates-webrtc-bwe)
@@ -26,6 +31,7 @@ including the Steam Remote Play integration path. Everything below labelled as
     - [AV1 VUI defaults (WebRTC-tuned)](#av1-vui-defaults-webrtc-tuned)
     - [Client-driven IDR (no NVENC auto-refresh)](#client-driven-idr-no-nvenc-auto-refresh)
     - [Known limitations](#known-limitations)
+  - [Video post-processing (`VAEntrypointVideoProc`)](#video-post-processing-vaentrypointvideoproc)
 - [Installation](#installation)
   - [Quick install from this fork](#quick-install-from-this-fork)
   - [Packaging status](#packaging-status)
@@ -36,7 +42,9 @@ including the Steam Remote Play integration path. Everything below labelled as
   - [Kernel parameters](#kernel-parameters)
   - [Environment Variables](#environment-variables)
   - [Firefox](#firefox)
+    - [What Firefox actually requires from the driver](#what-firefox-actually-requires-from-the-driver)
   - [Chrome](#chrome)
+    - [What Chromium actually requires from the driver](#what-chromium-actually-requires-from-the-driver)
   - [MPV](#mpv)
   - [NVENC encode helper](#nvenc-encode-helper)
   - [Direct Backend](#direct-backend)
@@ -58,7 +66,7 @@ This fork supports both hardware **decoding** (NVDEC) and hardware **encoding** 
 |AV1|:heavy_check_mark:|Firefox 98+ is required.|
 |H.264|:heavy_check_mark:||
 |HEVC|:heavy_check_mark:|Some distros are shipping Firefox and/or FFMPEG with HEVC support disabled due to patent concerns.|
-|VP8|:heavy_check_mark:||
+|VP8|:heavy_check_mark:|Fixed in this fork — see [VP8 bitstream reconstruction](#vp8-bitstream-reconstruction). Upstream decodes VP8 to garbage.|
 |VP9|:heavy_check_mark:|Requires being compiled with `gstreamer-codecparsers-1.0`|
 |MPEG-2|:heavy_check_mark:||
 |VC-1|:heavy_check_mark:||
@@ -70,6 +78,81 @@ YUV444 is supported but requires:
 * \>= Turing (20XX/16XX)
 * HEVC
 * Direct backend
+
+### VP8 bitstream reconstruction
+
+VP8 is the one decode path where VA-API does not hand the driver everything
+NVDEC needs. The slice data buffer starts at the first partition, *after* the
+VP8 "uncompressed data chunk" (RFC 6386 §9.1) — the 3-byte frame tag, plus a
+3-byte sync code and the coded dimensions on a keyframe — but NVDEC still
+expects that chunk at the head of the bitstream it is given.
+
+Upstream recovered it by rewinding the client's slice-data pointer to the
+previous 16-byte boundary (`ptr & 0xf`) and using whatever bytes were there.
+That reads behind a buffer the driver does not own, and the rewind distance
+comes from *pointer alignment* rather than from the format, so it only lands on
+the real header by luck. In practice it did not: with FFmpeg the rewind
+overshot the 10-byte keyframe chunk by 4 bytes, the sync-code check then failed,
+and the fallback prepended ten zero bytes instead — so **every frame decoded to
+garbage**, measured at ~8.7 dB PSNR against libvpx.
+
+This fork reconstructs the chunk from the VA-API parameters it is actually
+given: `frame_type`, `version` and the dimensions from
+`VAPictureParameterBufferVP8`, and `first_part_size` from
+`VASliceParameterBufferVP8` (`partition_size[0] + ceil(macroblock_offset / 8)`,
+which reproduces the real frame tag's field exactly). No out-of-bounds read is
+involved and the result no longer depends on how the client allocated its
+buffers — which is also what made this fail in Chromium but not (visibly) in
+some other clients. VP8 hardware decode is now **bit-exact** with libvpx, pinned
+by `tests/test_vp8_decode.sh`.
+
+The one field VA-API does not carry is `show_frame`; it is set to 1, matching
+the value the driver already reports to NVDEC through
+`CUVIDPICPARAMS.CodecSpecific.vp8.vp8_frame_tag`.
+
+### Picture-index recycling (upstream #397)
+
+Every surface a context decodes into is assigned a picture index, which is how
+NVDEC addresses its decode surface array. Upstream took that index from a
+counter that only ever incremented and was never released when a surface was
+destroyed — so a context could service at most `surfaceCount` **distinct
+surfaces over its entire lifetime**, not that many concurrently. Past that,
+every `vaBeginPicture` returned `VA_STATUS_ERROR_MAX_NUM_EXCEEDED`
+("list argument exceeds maximum number").
+
+FFmpeg never hits this: it passes its whole surface pool as render targets up
+front and then reuses it. Chromium calls `vaCreateContext` with **zero** render
+targets — so the limit defaults to 32 — and then allocates surfaces on demand
+from a `DmabufVideoFramePool` that churns them across resolution changes and
+pool resizes. That is why the failure was reported as Chromium-only, and why it
+showed up sooner at higher resolutions.
+
+Indices are now a per-context pool: the lowest free slot is claimed on first
+use and returned when the surface is destroyed or moves to another context.
+Pinned by the `Picture indices are recycled across surface churn` case in
+`tests/test_decode.c`, which pushes 96 surfaces through a single context.
+
+### Surface / context destruction order
+
+A surface keeps a raw back-pointer to the context it was last used on, and
+VA-API does not require a client to destroy its surfaces before the context.
+`vaDestroyContext` used to free the context and leave those back-pointers
+dangling, so anything reading `surface->context` afterwards — `vaSyncSurface`
+checking whether it is an encode context, `vaGetImage`, the VideoProc blit,
+picture-index release on `vaDestroySurfaces` — was touching freed memory. It
+failed intermittently, depending on whether the allocator had reused the block,
+which is exactly the kind of fault that only surfaces under load.
+
+`vaDestroyContext` now clears the back-pointer on every surface that referenced
+it, so "the context is gone" is representable as `NULL` instead of as a stale
+pointer. It also releases each of those surfaces' resolve flags: the resolve
+thread has already been joined by that point, so anything still queued for it
+would never complete, and a later `vaSyncSurface` or `vaExportSurfaceHandle`
+would block forever waiting for a resolution that can no longer happen.
+
+Pinned by `Surfaces stay usable after their context is destroyed` in
+`tests/test_decode.c`, which destroys the context first and then syncs and
+destroys the surfaces.
 
 To view which codecs your card is capable of decoding you can use the `vainfo` command with this driver installed, or visit the NVIDIA website [here](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new#geforce).
 
@@ -93,6 +176,87 @@ line at driver init with the probe result.
 
 Actual encode capabilities depend on your GPU's NVENC generation. `vainfo` is the source of truth.
 
+Two things about how encode capability is *reported*, both of which used to be
+wrong in ways clients could not work around:
+
+* **Maximum encode dimensions are probed per codec**, from
+  `NV_ENC_CAPS_WIDTH_MAX` / `HEIGHT_MAX`, rather than being a single constant.
+  They are not uniform — on an RTX 5080 H.264 reports 4096x4096 while HEVC and
+  AV1 report 8192x8192 — so the previous hardcoded 4096 hid half of each axis of
+  8K HEVC/AV1 capability. `NVD_LOG=1` prints an `NVENC max encode size:` line at
+  init.
+* **Encode-only profiles are unioned into `vaQueryConfigProfiles`.** That list
+  is built from the NVDEC *decode* probe, and both Chromium and GStreamer
+  enumerate profiles first and only then ask for entrypoints — so a profile
+  missing from it is unreachable no matter what the entrypoint query says. This
+  hid H.264 High10 (which has no decode branch at all) and HEVC Main422_10
+  (whose decode path is compiled out, since NVDEC has no 4:2:2 support) on
+  hardware whose encoder handles both.
+
+### Packed headers
+
+NVENC authors its own SPS/PPS/VPS and slice headers and offers no API to inject
+a client-built slice header. So `VAConfigAttribEncPackedHeaders` advertises
+`SEQUENCE | MISC | RAW_DATA` — deliberately **not** `SLICE` or `PICTURE`.
+
+That incomplete set is the point. Chromium's `H264VaapiVideoEncoderDelegate`
+treats packed headers as all-or-nothing: only when `SEQUENCE|PICTURE|SLICE` are
+*all* advertised does it build them, and it then expects the driver to use them.
+Since we cannot, advertising the full set made Chromium build SPS/PPS and
+per-slice headers (with `has_emulation_bytes = 0`, expecting the driver to
+insert emulation-prevention bytes) that were then silently discarded — wasted
+work, and a standing risk that its `frame_num`/ref-list assumptions diverge from
+the headers NVENC actually wrote. With the set incomplete, Chromium configures
+`VA_ENC_PACKED_HEADER_NONE` and leaves header authoring to the driver, which is
+what NVENC does anyway. FFmpeg and GStreamer both tolerate the missing `SLICE`
+bit and fall back the same way; they only need `MISC` / `RAW_DATA` to gate SEI
+and AUD insertion.
+
+### Encode logging
+
+The encode path re-runs its entire parameter plumbing on every frame — Chromium
+resends the sequence, picture and misc parameter buffers each time — so anything
+logged unconditionally in there comes out several times per frame. At 4K60 that
+is hundreds of identical lines a second, and it buries the things worth seeing:
+a resolution change, a bitrate change, a reconfigure, an error.
+
+So the per-frame sites are quiet unless something actually changes. Each one
+keeps a snapshot of what it last printed and only logs on a difference —
+geometry (surface/encoder/copy dimensions, format, bit depth), sequence
+parameters, rate control, framerate, and temporal-layer structure. A steady
+stream therefore logs each of these exactly once, at the start; a mid-session
+change still prints immediately. What NVENC actually programmed is reported
+separately by `nvenc_reconfigure_if_needed`, which was already change-driven.
+
+Pure per-frame progress — `frame N encoded, X bytes` and `frame N buffered` —
+has no meaningful "changed" state, so it moved behind `NVD_LOG_VERBOSE=1`.
+Use `NVD_STATS=1` for throughput instead.
+
+Measured on a 240-frame 3840x2112 H.264 encode: **560 log lines before, 79
+after**, with the remainder being one-time session setup.
+`NVD_LOG_VERBOSE=1` restores the full per-frame detail. Pinned by
+`tests/test_log_verbosity.sh`, which asserts the log stays bounded by session
+setup rather than growing with frame count.
+
+**Deciding whether to log costs nothing when logging is off.** `LOG()` cannot
+be made a guarded macro — 76 call sites rely on it supplying its own trailing
+semicolon — so it always calls `logger()`, which early-returns when there is no
+destination. That is fine for once-per-session sites, but a change-detecting
+site has to *build and compare a value* before it can decide, and doing that on
+every frame regardless of whether anyone is listening is exactly the kind of
+cost that should not exist on a hot path. Every such site is therefore wrapped
+in `LOG_ENABLED()` — a plain global bool, so it compiles to a single load and
+an easily-predicted branch, with the comparison laid out as a cold path the
+compiler jumps over. `nvenc_log_state_changed()` also returns `false` outright
+when logging is disabled, so a call site that forgets the guard costs one
+branch rather than a `memcmp` plus `memcpy` per frame. `NVD_LOG_VERBOSE` now
+also requires a destination, so verbose without `NVD_LOG` is inert instead of
+formatting output that gets dropped.
+
+In practice the saving is below measurement noise at 4K (a ~20-byte `memcmp`
+against a 4K NVENC encode is nothing) — this is about the hot path not carrying
+avoidable work, not about a throughput win.
+
 ### Rate control
 
 Modes: CQP, CBR, VBR. `VAEncMiscParameterRateControl` parses
@@ -102,6 +266,16 @@ Modes: CQP, CBR, VBR. `VAEncMiscParameterRateControl` parses
 via `enableMinQP` / `enableMaxQP`. For CONSTQP, `VAEncPictureParameterBuffer`'s
 `pic_init_qp` (H.264) and equivalent (HEVC) can override QP per picture —
 picked up by `nvenc_reconfigure_if_needed` before the next frame.
+
+For **AV1** the per-picture quantizer arrives as
+`VAEncPictureParameterBufferAV1::base_qindex` instead. This matters because it
+is the *entire* rate-control channel under Chromium: its AV1 encoder delegate
+runs the config in CQP mode and does rate control itself in software, pushing
+the result as a fresh `base_qindex` on every frame — it sends no
+`VAEncMiscParameterTypeRateControl` for AV1 at all. AV1's qindex is 0-255 and is
+exactly what NVENC's AV1 encoder takes as its QP, so it maps across without
+rescaling; `min_base_qindex` / `max_base_qindex` feed the adaptive-QP bounds.
+Pinned by the `AV1 base_qindex drives coded size` case in `tests/test_encode.c`.
 
 The client-side format-negotiation caveat still applies: some ffmpeg paths
 may renegotiate HEVC rext + `yuv444p10le` down to `yuv420p10le` before
@@ -190,6 +364,72 @@ keyframes explicitly).
   and hasn't been audited for correct chroma-plane addressing on 4:2:2
   and 4:4:4 sources. Intended for transcoding-style workloads where
   the source is already in the target chroma format.
+- **Decode surfaces shorter than 176px fall back to software.** The
+  driver advertises `VASurfaceAttribMinHeight = 176` for decode configs
+  even when NVDEC reports a smaller minimum (typically 64). NVIDIA's
+  block-linear DRM format modifier encodes a GOB block height chosen
+  from each *plane's* height, and a 4:2:0 chroma plane is half the luma
+  height — so below a threshold chroma lands in a smaller block-height
+  bucket than luma and the two planes carry genuinely different
+  modifiers. Measured on this driver the two converge at exactly luma
+  height **172**, independent of width and identical for NV12 and P010.
+  Below that there is no `VADRMPRIMESurfaceDescriptor` that is both
+  correct and safe: a descriptor object carries exactly one modifier, so
+  a single-object export (SINGLE/COMBINED) describes chroma with luma's
+  tiling and renders green macroblocks, while a one-object-per-plane
+  export (MULTI) reports the true modifiers and trips Chromium's
+  `CHECK_EQ(objects[0].modifier, objects[i].modifier)` in
+  `ExportVASurfaceAsNativePixmapDmaBufUnwrapped` — a GPU-process abort,
+  not a recoverable error. Advertising the floor makes clients
+  transparently use software for sub-QCIF content instead. Pinned by
+  `tests/test_descriptor_mode.c` (both the AUTO and `descriptor_mode_multi`
+  runs). This matches the mitigation in upstream issue #440.
+
+## Video post-processing (`VAEntrypointVideoProc`)
+
+Advertised for `VAProfileNone`. Supports NV12/P010/P012 → RGB colour conversion
+(BT.601/709/2020, limited and full range) and same-format plane copies, with
+**crop and scale** on both.
+
+Geometry matters more than it looks. Chromium reaches this path through
+`VaapiImageProcessorBackend` whenever a decoded surface cannot be imported into
+EGL directly — it then asks for AR24/BGR4 output *with* a source rectangle and a
+different output size. The driver used to reject any request whose source and
+destination regions were not identical and origin-aligned, and Chromium's
+response to that failure is not to retry differently: it drops the entire stream
+to software decode. The same geometry shows up on the encode side, where
+Chromium blits camera/screen-capture frames to the encoder's input size.
+
+How it is implemented:
+
+* **1:1 origin-aligned blits** keep the existing GPU path — a PTX kernel for
+  YUV→RGB, `cuMemcpy2D` for same-format copies. This is the common case and is
+  unchanged.
+* **Pure crops** at the same scale are done on the GPU with `cuMemcpy2D`
+  source/destination offsets: exact, and free.
+* **Anything that changes size** is resampled bilinearly on the CPU. The PTX
+  kernels sample the source at the destination coordinate, so they can only
+  express an identity blit; adding a GPU scaler would mean hand-writing another
+  PTX kernel. Since this is a fallback that only runs when a client explicitly
+  asks for scaling, correctness was worth more than throughput here — a working
+  CPU scale beats `VA_STATUS_ERROR_OPERATION_FAILED` and a whole stream on
+  software decode.
+
+Not supported: deinterlacing, rotation, mirroring, blending, or any
+`VAProcFilter`. `vaQueryVideoProcFilters` / `vaQueryVideoProcPipelineCaps` are
+unavailable (the driver does not install a `VADriverVTableVPP`); no browser
+calls them, but GStreamer's `vapostproc` does.
+
+Pinned by `tests/test_vpp.c`.
+
+> **Note:** fixing this surfaced a related bug in `vaCreateImage`, which
+> reported `pitches[i] = width * bppc` and ignored the channel count. That is
+> right by coincidence for NV12/P010 (the UV plane's horizontal subsampling
+> cancels its two channels) but 4x too small for the packed RGB formats, so
+> `vaGetImage`/`vaPutImage` on an RGB image failed with
+> `CUDA_ERROR_INVALID_VALUE`. Relatedly, `vaGetImage` required the surface to
+> have a decode context, which VA-API does not ask for and which made VideoProc
+> outputs unreadable; it now requires only a realised backing image.
 
 # Installation
 
@@ -267,6 +507,7 @@ Environment variables used to control the behavior of this library.
 | Variable | Purpose |
 |---|---|
 | `NVD_LOG` | Used to control logging. `1` to log to stdout, anything else to append to the given file. |
+| `NVD_LOG_VERBOSE` | Set to anything other than `0` to include the per-frame debug logging that is suppressed by default — see [Encode logging](#encode-logging). Noisy: expect several lines per frame. |
 | `NVD_MAX_INSTANCES` | Controls the maximum concurrent instances of the driver will be allowed per-process. This option is only really useful for older GPUs with not much VRAM, especially with Firefox on video heavy websites. |
 | `NVD_BACKEND` | Controls which backend this library uses. Either `egl`, or `direct` (default). See [direct backend](#direct-backend) for more details. |
 | `NVD_MAX_DETACHED_BACKING_IMAGE_BYTES` | Upper bound (in bytes) on the size of the detached backing-image cache used by the direct backend to recycle decode surfaces across stream switches. Lower this on low-VRAM GPUs to reduce memory usage at the cost of more re-allocation when streams change. Set to `0` to disable detached caching. Default: scales with the GPU — total VRAM / 64 (~1.6%), clamped to 64 MiB–512 MiB; falls back to `134217728` (128 MiB) if the VRAM size cannot be queried. |
@@ -277,10 +518,16 @@ Environment variables used to control the behavior of this library.
 Due to license, Firefox on Linux does not support HEVC till now.
 To use the driver with firefox you will need at least Firefox 96, `ffmpeg` compiled with vaapi support (`ffmpeg -hwaccels` output should include vaapi), and the following config options need to be set in the `about:config` page:
 
+> **H.264 and HEVC need a *system* ffmpeg.** Firefox's bundled ffvpx is built
+> with only `vp9_vaapi,vp8_vaapi,av1_vaapi` hwaccels, and its H.264/HEVC
+> decoders are compiled in only when a system libavcodec is present. If
+> `vainfo` shows the H.264 profiles but Firefox still decodes H.264 in
+> software, this — not the driver — is usually why.
+
 | Option | Value | Reason |
 |---|---|---|
-| media.ffmpeg.vaapi.enabled | true | Required until Firefox 137, enables the use of VA-API. |
-| media.hardware-video-decoding.force-enabled | true | Required since Firefox 137, enables hardware acceleration. |
+| media.ffmpeg.vaapi.enabled | true | Required until Firefox 137, enables the use of VA-API. Removed entirely in later builds ([bug 1748862](https://bugzilla.mozilla.org/show_bug.cgi?id=1748862)) — harmless to leave set. |
+| media.hardware-video-decoding.force-enabled | true | Required since Firefox 137. **`force-enabled`, not `enabled`** — NVIDIA is blocklisted unconditionally for `FEATURE_HARDWARE_VIDEO_DECODING` in `widget/gtk/GfxInfo.cpp` ("Disable on all NVIDIA hardware"), and only the force pref outranks a blocklist entry. It does *not* override a failed probe. |
 | media.rdd-ffmpeg.enabled | true | Required, default on FF97. Forces ffmpeg usage into the RDD process, rather than the content process. |
 | media.av1.enabled | false | Optional, disables AV1. If your GPU doesn't support AV1, this will prevent sites using it and falling back to software decoding. |
 | gfx.x11-egl.force-enabled | true | Required, this driver requires that Firefox use the EGL backend. It may be enabled by default. It is recommended to test it with the `MOZ_X11_EGL=1` environment variable before enabling it in the Firefox configuration. |
@@ -290,7 +537,7 @@ In addition the following environment variables need to be set. For permanent co
 
 | Variable | Value | Reason |
 |---|---|---|
-| MOZ_DISABLE_RDD_SANDBOX | 1 | Disables the sandbox for the RDD process that the decoder runs in. |
+| MOZ_DISABLE_RDD_SANDBOX | 1 | Disables the sandbox for the RDD process that the decoder runs in. Needed for two independent reasons: this driver skips CUDA init when it cannot read `/proc/version` (bypassable on its own with `NVD_FORCE_INIT=1`), and `RDDSandboxPolicy` returns `ENOTTY` for ioctl type `'F'` — the NVIDIA RM magic — while the file broker denies `/dev/nvidiactl` and `/dev/nvidia*`. |
 | LIBVA_DRIVER_NAME | nvidia | Required for libva 2.20+, forces libva to load this driver. |
 | __EGL_VENDOR_LIBRARY_FILENAMES | /usr/share/glvnd/egl_vendor.d/10_nvidia.json | Required for the 470 driver series only. It overrides the list of drivers the glvnd library can use to prevent Firefox from using the MESA driver by mistake. |
 | CUDA_DISABLE_PERF_BOOST | 1 | Optional. Requires NVIDIA driver >= 580.105.08. Disables the forced power boost the GPU gets when CUDA is activated. This should reduce the power usage when decoding video. This setting is the equivilent of the 'CUDA Force P2' NVIDIA Profile Inspector setting on Windows. |
@@ -302,33 +549,130 @@ LIBVA_MESSAGING_LEVEL=1
 
 If you're using the Snap version of Firefox, it will be unable to access the host version of the driver that is installed.
 
+### What Firefox actually requires from the driver
+
+Firefox does not go through FFmpeg's VA-API surface export — it wraps libva
+itself (`VALibWrapper.cpp`) and binds exactly **two** symbols,
+`vaExportSurfaceHandle` and `vaSyncSurface`. It refuses to use libva at all if
+`vaExportSurfaceHandle` is missing. Two consequences worth knowing, both pinned
+by `tests/test_client_contracts.c`:
+
+* **Export happens before sync, and a failing sync is only logged.** Firefox
+  calls `vaExportSurfaceHandle` first and `vaSyncSurface` afterwards, so the
+  export itself has to return a fully resolved surface. Any driver logic that
+  finalized a frame inside `vaSyncSurface` would race here. This driver resolves
+  inside the export, so the ordering is safe.
+* **Only NV12, YV12, P010 and P016 are importable.**
+  `DMABufSurfaceYUV::ImportPRIMESurfaceDescriptor` understands nothing else and
+  mis-imports silently rather than failing. 12-bit surfaces are therefore
+  exported with the descriptor fourcc `P016` rather than `P012` — the two are
+  the same two-plane 16-bit-container layout, differing only in how many of the
+  container bits are significant, and the samples are left-aligned so the unused
+  low bits read as zero. The surface is still reported as `P012` through
+  `vaQueryImageFormats` and the surface attributes, so clients that understand
+  the distinction are unaffected.
+
+Note also that Firefox has **no VA-API encode path at all** — see
+[Encode Support](#encode-support).
+
 ## Chrome
 
 This fork includes the Chromium-compatible single-buffer export path. For Chrome / Chromium based browsers, set `LIBVA_DRIVER_NAME=nvidia` and start the browser with flags similar to:
 
 ```sh
 LIBVA_DRIVER_NAME=nvidia google-chrome \
-  --enable-features=AcceleratedVideoDecodeLinuxGL,AcceleratedVideoEncodeLinuxGL,VaapiOnNvidiaGPUs,VaapiVideoEncoder,VaapiIgnoreDriverChecks \
+  --enable-features=VaapiOnNvidiaGPUs,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL,AcceleratedVideoEncoder,VaapiIgnoreDriverChecks \
   --ignore-gpu-blocklist \
   --use-gl=angle --use-angle=gl
 ```
 
-To use hardware AV1 encoding you must pass the encode-related features
-(`AcceleratedVideoEncodeLinuxGL` / `VaapiVideoEncoder`) in addition to the decode
-ones — without them Chrome never probes the VA-API encoder and silently falls back
-to software `libaom`.
+**`VaapiOnNvidiaGPUs` is the flag that actually matters.** Without it Chromium
+skips any render node whose DRM driver name is `nvidia-drm` outright — decode
+*and* encode, before any driver code runs (`media/gpu/vaapi/vaapi_wrapper.cc`,
+citing `crbug.com/1492880`). No other flag substitutes for it.
+
+The rest, and what they are really for:
+
+| Flag | Why |
+|---|---|
+| `AcceleratedVideoDecodeLinuxGL` | Enabled by default, but harmless to state explicitly. |
+| `AcceleratedVideoDecodeLinuxZeroCopyGL` | Enabled by default. Lets Chromium use the exported NV12/P010 dma-buf directly instead of running it through a VPP conversion to ARGB. |
+| `AcceleratedVideoEncoder` | **Disabled by default.** Without it Chrome never probes the VA-API encoder and silently falls back to software (`libaom` for AV1, OpenH264 for H.264). |
+| `VaapiIgnoreDriverChecks` | Only consulted on the ANGLE-**Vulkan** path, where Chromium otherwise refuses a non-Intel Vulkan vendor. On `--use-angle=gl` it is a no-op; harmless to leave on. |
+| `--ignore-gpu-blocklist` | Widely recommended, but the only Linux/NVIDIA video entry in `software_rendering_list.json` is scoped to driver versions older than 331.38, so modern drivers are not blocklisted. Not what is blocking you. |
+
+> **Flag names changed around M131.** `VaapiVideoDecodeLinuxGL`,
+> `VaapiVideoEncoder` and `AcceleratedVideoEncodeLinuxGL` are the old spellings;
+> the current registered names are `AcceleratedVideoDecoder` /
+> `AcceleratedVideoEncoder` and the `...LinuxGL` variants above. There are no
+> `chrome://flags` entries for any of these — `--enable-features=` only.
 
 On Wayland, also try `--ozone-platform=wayland` or `--ozone-platform-hint=auto`.
+
+### What Chromium actually requires from the driver
+
+Chromium dlopens libva and binds exactly 44 symbols (`media/gpu/vaapi/va.sigs`).
+`vaSyncBuffer`, `vaQuerySurfaceStatus`, `vaAcquireBufferHandle`, `vaCopy` and
+`vaMapBuffer2` are **not** among them, and the protected-content entry points
+are ChromeOS-only — so none of those matter here. What does:
+
+* **Exported objects must all report the same `drm_format_modifier`.** Chromium
+  `CHECK_EQ`s them, which aborts the GPU process rather than falling back. See
+  [Known limitations](#known-limitations) for the 176px height floor this forces.
+* **`vaCreateContext` is called with zero render targets**, so the driver sizes
+  its decode surface pool itself — and must recycle picture indices, see
+  [Picture-index recycling](#picture-index-recycling-upstream-397).
+* **`vaDeriveImage` must fail with exactly `VA_STATUS_ERROR_OPERATION_FAILED`.**
+  Chromium's encode upload path only falls back to `vaCreateImage` +
+  `vaPutImage` on that specific status; any other error is fatal.
+* **Encode input dma-bufs are imported with the legacy
+  `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME`** plus `VASurfaceAttribExternalBuffers`,
+  not PRIME_2 — Chromium only uses PRIME_2 import for drivers it recognises by
+  vendor string (iHD / Mesa Gallium), and ours is classified as "other".
+* **A VideoProc blit may carry a source rectangle and a different output size** —
+  see [Video post-processing](#video-post-processing-vaentrypointvideoproc).
+
+Being classified as "other" is not all bad: Chromium takes the global VA-API
+lock around every call for unrecognised drivers, so it never exercises this
+driver's thread-safety on its own.
+
+Two things Chromium cannot use no matter what the driver advertises: **HEVC
+encode** (its encodable-profile allowlist is H.264 CBP/Main/High, VP8, VP9
+Profile0, AV1 Profile0 and JPEG) and **hardware temporal SVC** on Linux
+(`GetSupportedScalabilityModes` returns `{kL1T1}`; the L1T2/L1T3 block is
+`#if BUILDFLAG(IS_CHROMEOS)`, and Chromium implements H.264 temporal layers
+itself via reference-list manipulation).
 
 ### WebRTC temporal scalability (screenshare)
 
 WebRTC screenshare uses temporal SVC (e.g. `scalabilityMode=L1T2`). This driver
-advertises temporal-layer support for AV1 (`VAConfigAttribEncRateControlExt`) and
-programs NVENC's temporal SVC from the layer structure supplied by the browser, so
-Chrome will use the hardware AV1 encoder instead of falling back to software. If you
-still see `encoderImplementation` reporting `libaom` in `chrome://webrtc-internals`,
-disable Chrome's software-fallback with `--disable-features=WebRtcAllowsSvcHardwareFallback`
-to surface the real encoder-selection result.
+advertises temporal-layer support for AV1 (`VAConfigAttribEncRateControlExt`,
+up to 4 layers) and programs NVENC's temporal SVC from the layer structure
+supplied by the client.
+
+> **Chrome on Linux will not use this.** Its
+> `VaapiVideoEncodeAccelerator::GetSupportedScalabilityModes` returns `{kL1T1}`
+> off ChromeOS — the whole L1T2/L1T3/L2T2Key block is inside
+> `#if BUILDFLAG(IS_CHROMEOS)` — so hardware SVC is never negotiated, and
+> `VAConfigAttribEncRateControlExt` is never even read. Where Chrome does use
+> H.264 temporal layers it builds them itself, by manipulating `frame_num` and
+> the reference lists and emitting a prefix NALU as raw packed-header data; no
+> VA-API SVC attribute is involved. The driver's AV1 SVC path is therefore
+> reachable from GStreamer, OBS and other non-browser clients, not from Chrome.
+>
+> If `chrome://webrtc-internals` reports `encoderImplementation: libaom`,
+> hardware encode is not being selected at all — check `AcceleratedVideoEncoder`
+> and `VaapiOnNvidiaGPUs` are set, rather than looking for an SVC problem.
+> `--disable-features=WebRtcAllowsSvcHardwareFallback` will surface the real
+> encoder-selection result instead of a silent fallback.
+
+What Chrome's WebRTC *does* need from the encoder is narrower than it looks:
+`VA_RC_CBR` honoured with mid-stream `VAEncMiscParameterTypeRateControl` /
+`FrameRate` / `HRD` updates applied without rebuilding the context (see
+[Live rate-control / framerate updates](#live-rate-control--framerate-updates-webrtc-bwe)),
+`idr_pic_flag` honoured on demand, and no silent frame dropping —
+`rc_flags.bits.disable_frame_skip` is set on every frame. WebRTC always requests
+`Bitrate::ConstantBitrate`, so the VBR path is never exercised by the browser.
 
 > **Note:** if AV1 *decode* also regresses to software after enabling the encode
 > features, make sure you are running a driver build that resolves an ambiguous
@@ -489,8 +833,27 @@ Individual harnesses:
 | `tests/test_ffmpeg.sh` | End-to-end ffmpeg + VA-API smoke test. Defaults to `samples/smptebars_h264.mp4` (produced by `samples/gensamples.sh`); override with a positional path argument. |
 | `tests/test_encode_roundtrip.sh` | Encode → software-decode → PSNR roundtrip for each hardware codec (H.264, HEVC, AV1). Reference and decoded output are both dumped to raw yuv420p so no container colorspace-label mismatch pollutes the comparison. Threshold 30 dB — sits solidly between "legit lossy encode at 20 Mbps" (typically 40-70 dB on the fixtures) and "bitstream garbage" (typically low-20s or worse). Two fixtures: the shipped smpte bars, plus a high-frequency testsrc2 stress source generated at test time. Current known failure: `hevc_vaapi` on the stress fixture (RPS reconstruction on the second GOP boundary — see [Known limitations](#known-limitations)). |
 | `tests/test_gstreamer.sh` | End-to-end GStreamer VA-API smoke test. |
+| `tests/test_log_verbosity.sh` | Asserts the encode log stays bounded by session setup rather than growing with frame count, and that `NVD_LOG_VERBOSE=1` still restores the full per-frame detail. See [Encode logging](#encode-logging). |
+| `tests/test_vp8_decode.sh` | VP8 hardware decode vs libvpx, bit-exactness required. Guards the reconstructed uncompressed data chunk — see [VP8 bitstream reconstruction](#vp8-bitstream-reconstruction). Generates its own fixture. |
+| `test_vpp` | `VAEntrypointVideoProc` blit geometry: 1:1, crop, scale, and crop+scale, verified by painting a luma ramp and reading back known pixels. |
+| `test_client_contracts` | The low-level behaviours Chromium/Firefox/FFmpeg depend on and that are easy to break silently: unknown config attributes reported as `VA_ATTRIB_NOT_SUPPORTED`, `vaCreateConfig` with zero attributes, `vaDeriveImage` failing with exactly `VA_STATUS_ERROR_OPERATION_FAILED`, export-before-sync resolving correctly, and the exported descriptor fourcc staying within the set Firefox can import. |
 
 Every code change to this fork lands with a test — see [Development workflow](#development-workflow) below.
+
+> **GStreamer needs `GST_VA_ALL_DRIVERS=1`.** The `va` plugin allow-lists driver
+> vendor strings (`gstvadisplay.c` prefix-matches "Mesa Gallium driver",
+> "Intel i965 driver", "Intel iHD driver"); anything else is
+> `GST_VA_IMPLEMENTATION_OTHER` and display creation fails unless that variable
+> is set — no elements register at all. Note the older `gstreamer-vaapi` plugin
+> (`GST_VAAPI_ALL_DRIVERS`) had no such filter, but was removed in GStreamer 1.28.
+
+> **`vaSyncBuffer` is deliberately left unimplemented** (a NULL vtable slot, so
+> libva returns `VA_STATUS_ERROR_UNIMPLEMENTED`). FFmpeg decides whether to use
+> asynchronous encode with a single probe call —
+> `vaSyncBuffer(display, VA_INVALID_ID, 0)` — and treats **any** return other
+> than `VA_STATUS_ERROR_UNIMPLEMENTED` as "async supported". A well-meaning stub
+> returning `VA_STATUS_SUCCESS` would silently promote FFmpeg to a mode this
+> driver does not implement. Neither Chromium nor Firefox binds the symbol at all.
 
 ## Sample media
 
