@@ -469,12 +469,12 @@ To install and use `nvidia-vaapi-driver`, follow the steps in installation and c
 
 * NVIDIA driver series 470 or 500+
 
-## Quick install from this fork
+## Quick install
 
-This fork's `main` branch is intended to match the locally tested AoTofu driver build. If the repository is private, clone it with a GitHub account that has access:
+You can use the installer script to install the driver:
 
 ```sh
-git clone git@github.com:AoTofu/nvidia-vaapi-driver.git
+git clone https://github.com/elFarto/nvidia-vaapi-driver.git
 cd nvidia-vaapi-driver
 ./install.sh --deps --clean
 ```
