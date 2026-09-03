@@ -64,6 +64,7 @@ sources = [
     'src/mpeg2.c',
     'src/mpeg4.c',
     'src/nvenc.c',
+    'src/nvenc-caps.c',
     'src/nvenc_dispatch.c',
     'src/nvenc-ipc-client.c',
     'src/stats.c',
@@ -93,15 +94,18 @@ shared_library(
 )
 
 # Build the 64-bit NVENC helper daemon (only for native builds, not cross-compiled i386)
-if host_machine.cpu_family() == 'x86_64' or host_machine.cpu_family() == 'aarch64'
+nvenc_helper = []
+have_nvenc_helper = host_machine.cpu_family() == 'x86_64' or host_machine.cpu_family() == 'aarch64'
+if have_nvenc_helper
     helper_deps = [
         cc.find_library('dl', required : false),
         dependency('ffnvcodec', version: '>= 11.1.5.1'),
         dependency('threads'),
     ]
-    executable(
+    nvenc_helper = executable(
         'nvenc-helper',
         'src/nvenc-helper.c',
+        'src/nvenc-caps.c',         # shared capability enumeration (CMD_CAPS)
         'src/nvenc-ipc-client.c',   # for nvenc_ipc_get_socket_path
         dependencies: helper_deps,
         install: true,
@@ -137,6 +141,19 @@ if not meson.is_cross_build()
     test_encode_config = executable('test_encode_config', 'tests/test_encode_config.c',
         dependencies : libva_test_deps, install : false)
     test('encode_config', test_encode_config, timeout : 60, env : test_env)
+
+    # The CUDA-less encode-only path (32-bit clients such as Steam), forced on
+    # this box with CUDA_VISIBLE_DEVICES="". Every other test in the suite runs
+    # with a working CUDA context, so nothing else notices when this mode
+    # regresses -- and when it does, the symptom downstream is a silent fall
+    # back to software encoding rather than an error.
+    if have_nvenc_helper
+        test_encode_only = executable('test_encode_only', 'tests/test_encode_only.c',
+            dependencies : libva_test_deps, install : false)
+        test('encode_only', find_program('tests/test_encode_only.sh'),
+             args : [test_encode_only, nvenc_helper],
+             timeout : 120, env : test_env, is_parallel : false)
+    endif
 
     test_decode = executable('test_decode', 'tests/test_decode.c',
         dependencies : libva_test_deps, install : false)

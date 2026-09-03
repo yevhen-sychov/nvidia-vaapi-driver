@@ -743,6 +743,21 @@ out:
 }
 
 
+/* Every profile this fork can encode, in advertisement order. What the local
+ * GPU actually accepts is decided per profile by nvenc_is_encode_profile_supported()
+ * against the capability probe; this is just the candidate set.
+ *
+ * Used both to top up the decode-derived profile list (nvQueryConfigProfiles2)
+ * and to build the whole list in encode-only mode, where there is no decode
+ * side to derive anything from. */
+static const VAProfile encodeProfileCandidates[] = {
+    VAProfileH264ConstrainedBaseline, VAProfileH264Main, VAProfileH264High,
+    VAProfileH264High10,
+    VAProfileHEVCMain, VAProfileHEVCMain10, VAProfileHEVCMain422_10,
+    VAProfileHEVCMain444, VAProfileHEVCMain444_10,
+    VAProfileAV1Profile0,
+};
+
 static VAStatus nvQueryConfigProfiles(
         VADriverContextP ctx,
         VAProfile *profile_list,	/* out */
@@ -882,15 +897,8 @@ static VAStatus nvQueryConfigProfiles2(
      * support) on hardware whose encoder handles both. */
     if (drv->nvencAvailable) {
         nvenc_probe_caps(drv);
-        static const VAProfile encodeOnlyCandidates[] = {
-            VAProfileH264ConstrainedBaseline, VAProfileH264Main, VAProfileH264High,
-            VAProfileH264High10,
-            VAProfileHEVCMain, VAProfileHEVCMain10, VAProfileHEVCMain422_10,
-            VAProfileHEVCMain444, VAProfileHEVCMain444_10,
-            VAProfileAV1Profile0,
-        };
-        for (size_t i = 0; i < ARRAY_SIZE(encodeOnlyCandidates); i++) {
-            const VAProfile candidate = encodeOnlyCandidates[i];
+        for (size_t i = 0; i < ARRAY_SIZE(encodeProfileCandidates); i++) {
+            const VAProfile candidate = encodeProfileCandidates[i];
             if (!nvenc_is_encode_profile_supported(drv, candidate)) {
                 continue;
             }
@@ -5012,13 +5020,22 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
             LOG("DRM backend init failed — surfaces will have no GPU backing");
         }
 
+        /* No decode side to enumerate, so the profile list is purely what the
+         * encoder can do. Probing here rather than lazily also means the one
+         * IPC round trip to the helper happens at init, not in the middle of a
+         * client's first vaQueryConfigEntrypoints call. */
+        nvenc_probe_caps(drv);
         int p = 0;
-        drv->profiles[p++] = VAProfileH264ConstrainedBaseline;
-        drv->profiles[p++] = VAProfileH264Main;
-        drv->profiles[p++] = VAProfileH264High;
-        drv->profiles[p++] = VAProfileHEVCMain;
-        drv->profiles[p++] = VAProfileHEVCMain10;
+        for (size_t i = 0; i < ARRAY_SIZE(encodeProfileCandidates); i++) {
+            if (p >= MAX_PROFILES) {
+                break;
+            }
+            if (nvenc_is_encode_profile_supported(drv, encodeProfileCandidates[i])) {
+                drv->profiles[p++] = encodeProfileCandidates[i];
+            }
+        }
         drv->profileCount = p;
+        LOG("Encode-only mode: advertising %d encode profile(s)", p);
     }
 
     *ctx->vtable = vtable;

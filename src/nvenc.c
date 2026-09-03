@@ -1,4 +1,6 @@
 #include "nvenc.h"
+#include "nvenc-caps.h"
+#include "nvenc-ipc.h"
 #include "vabackend.h"
 
 #include <string.h>
@@ -709,10 +711,13 @@ bool nvenc_is_encode_profile_supported(NVDriver *drv, VAProfile profile)
 {
     if (!nvenc_is_encode_profile(profile)) return false;
 
-    /* No probe results yet (CUDA-less / IPC-only build, or probe hasn't
-     * run) — fall back to the fork's historical hardcoded list. This is
-     * the pre-caps behavior for the base six profiles. */
-    if (!drv->nvencCapsProbed) {
+    /* No trustworthy probe results — the probe has not run yet, or it ran and
+     * failed (no NVENC library, scratch session refused, or encode-only mode
+     * with no helper to ask). Fall back to the fork's historical hardcoded
+     * list rather than reporting nothing: an empty answer here strips the
+     * encode entrypoint off every profile, which is how encode-only mode came
+     * to advertise no encoder at all to Steam. */
+    if (!drv->nvencCapsValid) {
         return profile == VAProfileH264ConstrainedBaseline ||
                profile == VAProfileH264Main ||
                profile == VAProfileH264High ||
@@ -877,158 +882,42 @@ NV_ENC_BUFFER_FORMAT nvenc_surface_format(VAProfile profile, int bitDepth)
 
 /* ---------------- Capability probe ----------------
  *
- * Opens a scratch NVENC session on drv->cudaContext, walks the encoder's
- * exported GUIDs / profile GUIDs / input format list / per-codec caps,
- * and records the results on drv. Called once, lazily, on the first
- * config-side encode query — cost is one session-open+destroy per driver
- * instance. */
+ * Records what this box's encoder actually supports on drv. Called once,
+ * lazily, on the first config-side encode query.
+ *
+ * Two sources, same enumeration (nvenc_caps_probe_session):
+ *   - CUDA available: open a scratch NVENC session on drv->cudaContext and
+ *     walk it directly. Cost is one session open+destroy per driver instance.
+ *   - encode-only mode: there is no CUDA context to open a session on, so ask
+ *     the 64-bit helper over IPC.
+ *
+ * Failure is not fatal. drv->nvencCapsValid records whether the answers can be
+ * trusted; when it is false the callers below fall back to the fork's built-in
+ * profile list instead of concluding the GPU cannot encode. */
 
-static bool guid_eq(const GUID *a, const GUID *b) {
-    return memcmp(a, b, sizeof(GUID)) == 0;
-}
-
-static bool nvenc_query_cap(NV_ENCODE_API_FUNCTION_LIST *funcs,
-                             void *encoder, GUID codecGuid,
-                             NV_ENC_CAPS capsToQuery, int *out) {
-    NV_ENC_CAPS_PARAM param = { .version = NV_ENC_CAPS_PARAM_VER,
-                                 .capsToQuery = capsToQuery };
-    return funcs->nvEncGetEncodeCaps(encoder, codecGuid, &param, out) == NV_ENC_SUCCESS;
-}
-
-bool nvenc_probe_caps(NVDriver *drv)
+static void nvenc_apply_caps(NVDriver *drv, const NVEncIPCCaps *caps, const char *source)
 {
-    if (drv->nvencCapsProbed) return true;
-    if (!drv->cudaAvailable || drv->cudaContext == NULL) {
-        LOG("NVENC caps probe skipped: no CUDA context (IPC-only build?)");
-        drv->nvencCapsProbed = true;  /* don't retry */
-        return false;
-    }
-    if (drv->nv == NULL) {
-        LOG("NVENC caps probe skipped: nvenc library not loaded");
-        drv->nvencCapsProbed = true;
-        return false;
-    }
+    drv->nvencSupportsH264           = caps->h264 != 0;
+    drv->nvencSupportsH264High10     = caps->h264High10 != 0;
+    drv->nvencSupportsHEVC           = caps->hevc != 0;
+    drv->nvencSupportsHEVCMain10     = caps->hevcMain10 != 0;
+    drv->nvencSupportsHEVCFrext      = caps->hevcFrext != 0;
+    drv->nvencSupportsAV1            = caps->av1 != 0;
+    drv->nvencSupportsAV1_10bit      = caps->av1_10bit != 0;
+    drv->nvencSupportsInputYUV444    = caps->inputYUV444 != 0;
+    drv->nvencSupportsInputYUV444_10 = caps->inputYUV444_10 != 0;
+    drv->nvencSupportsInputYUV422    = caps->inputYUV422 != 0;
+    drv->nvencSupportsInputYUV422_10 = caps->inputYUV422_10 != 0;
+    drv->nvencMaxWidthH264  = caps->maxWidthH264;
+    drv->nvencMaxHeightH264 = caps->maxHeightH264;
+    drv->nvencMaxWidthHEVC  = caps->maxWidthHEVC;
+    drv->nvencMaxHeightHEVC = caps->maxHeightHEVC;
+    drv->nvencMaxWidthAV1   = caps->maxWidthAV1;
+    drv->nvencMaxHeightAV1  = caps->maxHeightAV1;
 
-    NVENCContext tmp = {0};
-    if (!nvenc_open_session(&tmp, drv->nv, drv->cudaContext)) {
-        LOG("NVENC caps probe: could not open scratch session");
-        drv->nvencCapsProbed = true;
-        return false;
-    }
-
-    /* 1. Codec GUIDs the driver supports at all. */
-    uint32_t codecCount = 0;
-    if (tmp.funcs.nvEncGetEncodeGUIDCount(tmp.encoder, &codecCount) != NV_ENC_SUCCESS ||
-        codecCount == 0) {
-        LOG("NVENC caps probe: no codec GUIDs advertised");
-        goto done;
-    }
-    GUID *codecs = calloc(codecCount, sizeof(GUID));
-    if (!codecs) goto done;
-    uint32_t codecFilled = 0;
-    tmp.funcs.nvEncGetEncodeGUIDs(tmp.encoder, codecs, codecCount, &codecFilled);
-    for (uint32_t i = 0; i < codecFilled; i++) {
-        if      (guid_eq(&codecs[i], &NV_ENC_CODEC_H264_GUID)) drv->nvencSupportsH264 = true;
-        else if (guid_eq(&codecs[i], &NV_ENC_CODEC_HEVC_GUID)) drv->nvencSupportsHEVC = true;
-        else if (guid_eq(&codecs[i], &NV_ENC_CODEC_AV1_GUID))  drv->nvencSupportsAV1  = true;
-    }
-
-    /* 2. For each supported codec, walk the profile GUIDs it advertises.
-     * We only care about the ones that gate new fork surface: H264 High10
-     * (via NV_ENC_H264_PROFILE_HIGH_10_GUID) and HEVC FREXT (umbrella for
-     * Main422_10 / Main444 / Main444_10 via NV_ENC_HEVC_PROFILE_FREXT_GUID). */
-    GUID interested[] = {
-        NV_ENC_H264_PROFILE_HIGH_10_GUID,
-        NV_ENC_HEVC_PROFILE_MAIN10_GUID,
-        NV_ENC_HEVC_PROFILE_FREXT_GUID,
-    };
-    for (uint32_t i = 0; i < codecFilled; i++) {
-        uint32_t profCount = 0;
-        if (tmp.funcs.nvEncGetEncodeProfileGUIDCount(tmp.encoder, codecs[i],
-                                                     &profCount) != NV_ENC_SUCCESS)
-            continue;
-        if (profCount == 0) continue;
-        GUID *profs = calloc(profCount, sizeof(GUID));
-        if (!profs) continue;
-        uint32_t profFilled = 0;
-        tmp.funcs.nvEncGetEncodeProfileGUIDs(tmp.encoder, codecs[i], profs,
-                                              profCount, &profFilled);
-        for (uint32_t j = 0; j < profFilled; j++) {
-            for (size_t k = 0; k < sizeof(interested)/sizeof(interested[0]); k++) {
-                if (!guid_eq(&profs[j], &interested[k])) continue;
-                if (guid_eq(&interested[k], &NV_ENC_H264_PROFILE_HIGH_10_GUID))
-                    drv->nvencSupportsH264High10 = true;
-                else if (guid_eq(&interested[k], &NV_ENC_HEVC_PROFILE_MAIN10_GUID))
-                    drv->nvencSupportsHEVCMain10 = true;
-                else if (guid_eq(&interested[k], &NV_ENC_HEVC_PROFILE_FREXT_GUID))
-                    drv->nvencSupportsHEVCFrext = true;
-            }
-        }
-        free(profs);
-    }
-
-    /* 3. Per-codec caps for 10-bit / YUV444 / YUV422 encode. */
-    if (drv->nvencSupportsAV1) {
-        int cap = 0;
-        if (nvenc_query_cap(&tmp.funcs, tmp.encoder, NV_ENC_CODEC_AV1_GUID,
-                            NV_ENC_CAPS_SUPPORT_10BIT_ENCODE, &cap))
-            drv->nvencSupportsAV1_10bit = (cap != 0);
-    }
-
-    /* 3b. Maximum encode dimensions, per codec. These are not uniform: H.264
-     * tops out at 4096 on current hardware while HEVC and AV1 go to 8192, so
-     * reporting one hardcoded number through VAConfigAttribMaxPictureWidth /
-     * Height either hides 8K HEVC/AV1 capability or promises H.264 sizes the
-     * encoder will reject at session init. */
-    struct { bool supported; GUID guid; uint32_t *w, *h; } dims[] = {
-        { drv->nvencSupportsH264, NV_ENC_CODEC_H264_GUID,
-          &drv->nvencMaxWidthH264, &drv->nvencMaxHeightH264 },
-        { drv->nvencSupportsHEVC, NV_ENC_CODEC_HEVC_GUID,
-          &drv->nvencMaxWidthHEVC, &drv->nvencMaxHeightHEVC },
-        { drv->nvencSupportsAV1,  NV_ENC_CODEC_AV1_GUID,
-          &drv->nvencMaxWidthAV1,  &drv->nvencMaxHeightAV1 },
-    };
-    for (size_t i = 0; i < sizeof(dims) / sizeof(dims[0]); i++) {
-        if (!dims[i].supported) continue;
-        int cap = 0;
-        if (nvenc_query_cap(&tmp.funcs, tmp.encoder, dims[i].guid,
-                            NV_ENC_CAPS_WIDTH_MAX, &cap) && cap > 0)
-            *dims[i].w = (uint32_t) cap;
-        cap = 0;
-        if (nvenc_query_cap(&tmp.funcs, tmp.encoder, dims[i].guid,
-                            NV_ENC_CAPS_HEIGHT_MAX, &cap) && cap > 0)
-            *dims[i].h = (uint32_t) cap;
-    }
-
-    /* 4. Input formats — walk supported formats for each active codec to
-     * populate the YUV444 / YUV444_10 / YUV422 / YUV422_10 flags. Format
-     * support is codec-agnostic in NVENC's API but the cap query is per-
-     * codec, so we OR across the codecs we care about. */
-    for (uint32_t i = 0; i < codecFilled; i++) {
-        uint32_t fmtCount = 0;
-        if (tmp.funcs.nvEncGetInputFormatCount(tmp.encoder, codecs[i],
-                                                &fmtCount) != NV_ENC_SUCCESS ||
-            fmtCount == 0) continue;
-        NV_ENC_BUFFER_FORMAT *fmts = calloc(fmtCount, sizeof(NV_ENC_BUFFER_FORMAT));
-        if (!fmts) continue;
-        uint32_t fmtFilled = 0;
-        tmp.funcs.nvEncGetInputFormats(tmp.encoder, codecs[i], fmts, fmtCount,
-                                        &fmtFilled);
-        for (uint32_t j = 0; j < fmtFilled; j++) {
-            switch (fmts[j]) {
-            case NV_ENC_BUFFER_FORMAT_YUV444:        drv->nvencSupportsInputYUV444    = true; break;
-            case NV_ENC_BUFFER_FORMAT_YUV444_10BIT:  drv->nvencSupportsInputYUV444_10 = true; break;
-            case NV_ENC_BUFFER_FORMAT_NV16:          drv->nvencSupportsInputYUV422    = true; break;
-            case NV_ENC_BUFFER_FORMAT_P210:          drv->nvencSupportsInputYUV422_10 = true; break;
-            default: break;
-            }
-        }
-        free(fmts);
-    }
-    free(codecs);
-
-    LOG("NVENC caps: H264=%d(High10=%d) HEVC=%d(Main10=%d, FREXT=%d) "
+    LOG("NVENC caps (%s): H264=%d(High10=%d) HEVC=%d(Main10=%d, FREXT=%d) "
         "AV1=%d(10bit=%d) input{YUV444=%d YUV444_10=%d YUV422=%d YUV422_10=%d}",
+        source,
         drv->nvencSupportsH264, drv->nvencSupportsH264High10,
         drv->nvencSupportsHEVC, drv->nvencSupportsHEVCMain10,
         drv->nvencSupportsHEVCFrext,
@@ -1039,9 +928,51 @@ bool nvenc_probe_caps(NVDriver *drv)
         drv->nvencMaxWidthH264, drv->nvencMaxHeightH264,
         drv->nvencMaxWidthHEVC, drv->nvencMaxHeightHEVC,
         drv->nvencMaxWidthAV1,  drv->nvencMaxHeightAV1);
+}
 
-done:
+bool nvenc_probe_caps(NVDriver *drv)
+{
+    if (drv->nvencCapsProbed) return drv->nvencCapsValid;
+    drv->nvencCapsProbed = true;  /* one attempt per driver instance, either way */
+
+    if (!drv->cudaAvailable || drv->cudaContext == NULL) {
+        /* Encode-only mode: no CUDA context here to open a scratch session on,
+         * so ask the 64-bit helper -- it is looking at the same GPU and is the
+         * process that will do the encoding. If it cannot answer, leave
+         * nvencCapsValid false so nvenc_is_encode_profile_supported() falls
+         * back to the built-in profile list; reporting no capabilities at all
+         * would hide every encode entrypoint and drop clients to software. */
+        NVEncIPCCaps caps;
+        if (nvenc_ipc_query_caps(&caps) == 0) {
+            nvenc_apply_caps(drv, &caps, "via IPC helper");
+            drv->nvencCapsValid = true;
+            return true;
+        }
+        LOG("NVENC caps probe: helper did not answer, using built-in profile list");
+        return false;
+    }
+
+    if (drv->nv == NULL) {
+        LOG("NVENC caps probe skipped: nvenc library not loaded");
+        return false;
+    }
+
+    NVENCContext tmp = {0};
+    if (!nvenc_open_session(&tmp, drv->nv, drv->cudaContext)) {
+        LOG("NVENC caps probe: could not open scratch session");
+        return false;
+    }
+
+    NVEncIPCCaps caps;
+    bool ok = nvenc_caps_probe_session(&tmp.funcs, tmp.encoder, &caps);
     nvenc_close_session(&tmp);
-    drv->nvencCapsProbed = true;
+
+    if (!ok) {
+        LOG("NVENC caps probe: no codec GUIDs advertised");
+        return false;
+    }
+
+    nvenc_apply_caps(drv, &caps, "local probe");
+    drv->nvencCapsValid = true;
     return true;
 }

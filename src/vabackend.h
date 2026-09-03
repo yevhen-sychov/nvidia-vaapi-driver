@@ -216,10 +216,17 @@ typedef struct _NVDriver
      * NVENC capability probe results. Populated once, lazily, on the first
      * encode-config query. Used to gate profile advertisement so we don't
      * advertise (e.g.) HEVC Main422_10 on hardware that lacks YUV422
-     * encode. All bools default to false; nvencCapsProbed guards against
-     * duplicate probe work.
+     * encode. All bools default to false.
+     *
+     * nvencCapsProbed means "we tried", nvencCapsValid means "and got an
+     * answer worth believing". They are separate because a failed probe must
+     * not read as "this GPU supports nothing" -- in encode-only mode the probe
+     * has to go out to the 64-bit helper and can legitimately come back empty,
+     * and treating that as a negative answer strips the encode entrypoint from
+     * every profile. Callers fall back to the built-in list when !valid.
      */
     bool                    nvencCapsProbed;
+    bool                    nvencCapsValid;
     bool                    nvencSupportsH264;
     bool                    nvencSupportsH264High10;
     bool                    nvencSupportsHEVC;

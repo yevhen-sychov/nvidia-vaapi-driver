@@ -166,6 +166,15 @@ the fork's implementation ceiling; the actual set exposed to `vainfo`
 depends on what your card admits. `NVD_LOG=1` shows an `NVENC caps: ...`
 line at driver init with the probe result.
 
+The probe needs a CUDA context to open a scratch NVENC session on, which the
+process does not have in [encode-only mode](#encode-only-mode-no-cuda-in-process).
+There the driver asks the 64-bit helper instead (`NVENC caps (via IPC helper)`),
+and if no helper answers it falls back to the built-in list — H.264
+Constrained Baseline / Main / High, HEVC Main / Main10, AV1 Profile0 — rather
+than reporting no encode capability at all. A failed probe must not read as
+"this GPU cannot encode": that answer strips `VAEntrypointEncSlice` off every
+profile, and clients respond by silently falling back to software encoding.
+
 | Codec | Supported | Profiles | Comments |
 |---|---|---|---|
 |H.264|:heavy_check_mark:|Constrained Baseline, Main, High, High10|High10 requires 10-bit encode capability + `NV_ENC_H264_PROFILE_HIGH_10_GUID` (probed).|
@@ -512,6 +521,7 @@ Environment variables used to control the behavior of this library.
 | `NVD_BACKEND` | Controls which backend this library uses. Either `egl`, or `direct` (default). See [direct backend](#direct-backend) for more details. |
 | `NVD_MAX_DETACHED_BACKING_IMAGE_BYTES` | Upper bound (in bytes) on the size of the detached backing-image cache used by the direct backend to recycle decode surfaces across stream switches. Lower this on low-VRAM GPUs to reduce memory usage at the cost of more re-allocation when streams change. Set to `0` to disable detached caching. Default: scales with the GPU — total VRAM / 64 (~1.6%), clamped to 64 MiB–512 MiB; falls back to `134217728` (128 MiB) if the VRAM size cannot be queried. |
 | `NVD_MAX_DETACHED_BACKING_IMAGES` | Upper bound on the number of cached detached backing images. Set to `0` to disable detached caching. Default: `16`. |
+| `NVD_NVENC_HELPER` | Path to the `nvenc-helper` binary, overriding the built-in search (`/usr/libexec`, `/usr/local/libexec`, `/usr/lib/nvidia-vaapi-driver`). Used to point at an uninstalled build; the test suite sets it. |
 
 ## Firefox
 
@@ -784,6 +794,45 @@ After rebuilding the driver you can update and restart the helper via the provid
 
 The helper honours the `NVENC_HELPER_IDR_INTERVAL` environment variable to control the IDR/keyframe interval.
 
+### Encode-only mode (no CUDA in-process)
+
+When `cuInit()` itself fails in the client process, the driver keeps going in
+**encode-only mode** instead of failing to load: no decode entrypoints (there is
+no CUDA to decode with), surfaces allocated through the direct/DRM backend, and
+every encode delegated to the helper. `NVD_LOG=1` reports it at init:
+
+```
+CUDA init failed — encode-only mode via IPC helper
+...
+vainfo: Driver version: VA-API NVENC driver [IPC encode-only]
+```
+
+The case this exists for is a 32-bit client on a GPU whose CUDA support is
+64-bit only — Steam's client process on Blackwell reports
+`no CUDA-capable device is detected (100)` — where the 64-bit helper can still
+reach the encoder. You can reproduce the whole mode on a 64-bit box with
+`CUDA_VISIBLE_DEVICES=""`, which is how `meson test -C build encode_only`
+covers it.
+
+In this mode the profile list is built entirely from encoder capabilities, so
+what `vainfo` lists is exactly what the helper's GPU accepts:
+
+```sh
+CUDA_VISIBLE_DEVICES="" LIBVA_DRIVER_NAME=nvidia vainfo
+```
+
+Two things to know:
+
+* **The helper must be new enough to answer `CMD_CAPS`.** An older helper
+  replies "unknown command" and the driver drops to its built-in profile list —
+  encoding still works, the advertised set is just coarser. After upgrading the
+  driver, restart the service (`systemctl --user restart nvenc-helper.service`,
+  or run `update-nvenc.sh`) so the running helper matches.
+* **A capability query never waits on someone else's stream.** The helper serves
+  one client at a time, so the query uses a short-lived connection with a 2s
+  timeout and falls back rather than blocking a client's
+  `vaQueryConfigEntrypoints` for the length of a live encode session.
+
 ## Direct Backend
 
 The direct backend is a experimental backend that accesses the NVIDIA kernel driver directly, rather than using EGL to share the buffers. This allows us
@@ -828,6 +877,7 @@ Individual harnesses:
 | `test_descriptor_mode` | Standalone regression for the AUTO descriptor-mode contract: decode-only surface → SPLIT; decode + concurrent encode @ same res → SPLIT (no green macroblocks on peers); with `NVD_SELF_PREVIEW_COMBINED=1` → same case flips to COMBINED (opt-in fallback). |
 | `test_encode` | Encode entrypoints, config attributes, single-frame encode for H.264 / HEVC / HEVC Main10 / AV1 / AV1 Main10, rate control + quality-level params, AV1 temporal SVC and combined-RTFormat encode, dynamic resolution, sequential encodes, coded-buffer reuse, long-running single session, live bitrate/framerate reconfigure, auto-combined encode export, decode-still-works co-existence, dimension-mismatch, H.264 B-frames. |
 | `test_encode_config` | Config-side coverage: entrypoints, RTFormat, rate control, packed headers, ref frames, max dimensions, quality range, surface allocation (NV12 / P010 / small / 4K), export descriptor. |
+| `tests/test_encode_only.sh` | The CUDA-less [encode-only path](#encode-only-mode-no-cuda-in-process), forced with `CUDA_VISIBLE_DEVICES=""`. Runs twice: with no helper reachable (the driver must still advertise its built-in encode profiles — answering "no encode entrypoints" here is what drops clients to software x264), and against a helper it starts in a private `XDG_RUNTIME_DIR` (capabilities arrive over IPC, and a real H.264 + HEVC frame is encoded through it via `vaDeriveImage` + host memcpy, the way a client with no CUDA has to fill a surface). Every other test in the suite runs with a working CUDA context, so nothing else notices when this mode regresses. |
 | `test_ipc_fuzz` | Fuzz surface for the NVENC out-of-process IPC helper (invalid commands, truncated inits, oversized payloads, rapid connect/disconnect, double-init, encode-without-init). |
 | `test_concurrent_sessions` | Multi-session stress covering the WebRTC "camera + screenshare" flow: two H.264 encoders in parallel at the same resolution, staggered encoder-B-added-mid-stream (mimics `getDisplayMedia` while camera is live), encoder+decoder co-existence at the same resolution, secondary-encoder create/destroy churn, and a descriptor-shape stability probe that asserts a decode surface exports a bit-identical `VADRMPRIMESurfaceDescriptor` whether captured cold or during a concurrent live encoder (fourcc, dimensions, num_objects, num_layers, per-object size + modifier, per-layer format, per-plane offset + pitch all field-diffed). Hitting the NVENC concurrent-session cap reports SKIP, not FAIL. |
 | `tests/test_ffmpeg.sh` | End-to-end ffmpeg + VA-API smoke test. Defaults to `samples/smptebars_h264.mp4` (produced by `samples/gensamples.sh`); override with a positional path argument. |
@@ -950,6 +1000,19 @@ efortin PR #427 base and elFarto's upstream master. See
   actual bitset. High-tier profiles land only when the card exposes both
   the profile GUID and the matching input format (P210 for 422_10,
   YUV444/YUV444_10BIT for the 444 variants, H264 High10 GUID for High10).
+- **Encode-only mode actually advertises an encoder.** When `cuInit()` fails
+  in the client process (32-bit Steam on Blackwell), the capability probe has
+  no CUDA context to open a scratch NVENC session on. It now asks the 64-bit
+  helper over a new `CMD_CAPS` IPC command — same enumeration code, shared by
+  driver and helper (`src/nvenc-caps.c`) — and the encode-only profile list is
+  built from the answer instead of a hardcoded five. A probe that cannot run is
+  tracked separately from a probe that ran and said no (`nvencCapsProbed` vs
+  `nvencCapsValid`) so failure falls back to the built-in profile list; before
+  this, an unrunnable probe read as "this GPU encodes nothing", `vainfo`
+  listed no profiles at all, and ffmpeg reported *No usable encoding entrypoint
+  found for profile VAProfileHEVCMain* — Steam fell back to CPU x264.
+  Covered by `tests/test_encode_only.sh` in both the helper and no-helper
+  configurations.
 - **Rate-control QP hints** — `VAEncMiscParameterRateControl` now parses
   `initial_qp` / `min_qp` / `max_qp` and programs them into NVENC
   (`constQP` for CONSTQP mode, `initialRCQP` for CBR/VBR, `enableMinQP` /

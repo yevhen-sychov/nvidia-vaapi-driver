@@ -578,20 +578,12 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
     /* Connect to helper on first use */
     if (nvencCtx->ipcFd < 0) {
         /* Try connecting to an already-running helper first, then start one */
-        static const char *helper_paths[] = {
-            "/usr/libexec/nvenc-helper",
-            "/usr/local/libexec/nvenc-helper",
-            "/usr/lib/nvidia-vaapi-driver/nvenc-helper",
-            NULL
-        };
         nvencCtx->ipcFd = nvenc_ipc_connect();
         if (nvencCtx->ipcFd < 0) {
-            for (int pi = 0; helper_paths[pi] != NULL; pi++) {
-                if (access(helper_paths[pi], X_OK) == 0) {
-                    LOG("IPC encode: starting helper: %s", helper_paths[pi]);
-                    nvencCtx->ipcFd = nvenc_ipc_connect_or_start(helper_paths[pi]);
-                    if (nvencCtx->ipcFd >= 0) break;
-                }
+            const char *helperPath = nvenc_ipc_find_helper();
+            if (helperPath != NULL) {
+                LOG("IPC encode: starting helper: %s", helperPath);
+                nvencCtx->ipcFd = nvenc_ipc_connect_or_start(helperPath);
             }
         }
         if (nvencCtx->ipcFd < 0) {

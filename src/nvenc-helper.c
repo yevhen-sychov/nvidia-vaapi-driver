@@ -35,6 +35,7 @@
 #include <ffnvcodec/dynlink_loader.h>
 #include <ffnvcodec/nvEncodeAPI.h>
 #include "nvenc-ipc.h"
+#include "nvenc-caps.h"
 
 static CudaFunctions *cu;
 static NvencFunctions *nv_dl;
@@ -690,6 +691,72 @@ static void encoder_close(HelperEncoder *enc)
 }
 
 /* Handle one client connection */
+/* NVENC capabilities of this box's GPU, enumerated once on first request.
+ *
+ * The driver asks for these when it is running encode-only (no CUDA in its own
+ * process), because that is exactly the case where it cannot enumerate them
+ * itself. Cached because the answer is a property of the hardware, and opening
+ * a scratch session costs a CUDA context each time. */
+static NVEncIPCCaps cached_caps;
+static bool cached_caps_valid;
+static bool cached_caps_attempted;
+
+static bool get_caps(NVEncIPCCaps *out)
+{
+    if (cached_caps_attempted) {
+        *out = cached_caps;
+        return cached_caps_valid;
+    }
+    cached_caps_attempted = true;
+
+    CUcontext cudaCtx = NULL;
+    if (CHECK_CUDA_RESULT_HELPER(cu->cuCtxCreate(&cudaCtx, 0, 0))) {
+        return false;
+    }
+
+    NV_ENCODE_API_FUNCTION_LIST funcs = { .version = NV_ENCODE_API_FUNCTION_LIST_VER };
+    void *encoder = NULL;
+    NVENCSTATUS st = nv_dl->NvEncodeAPICreateInstance(&funcs);
+    if (st != NV_ENC_SUCCESS) {
+        HELPER_LOG("CMD_CAPS: NvEncodeAPICreateInstance failed: %d", st);
+        cu->cuCtxDestroy(cudaCtx);
+        return false;
+    }
+
+    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS sessParams = {0};
+    sessParams.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+    sessParams.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
+    sessParams.device = cudaCtx;
+    sessParams.apiVersion = NVENCAPI_VERSION;
+    st = funcs.nvEncOpenEncodeSessionEx(&sessParams, &encoder);
+    if (st != NV_ENC_SUCCESS) {
+        HELPER_LOG("CMD_CAPS: nvEncOpenEncodeSessionEx failed: %d", st);
+        cu->cuCtxDestroy(cudaCtx);
+        return false;
+    }
+
+    cached_caps_valid = nvenc_caps_probe_session(&funcs, encoder, &cached_caps);
+
+    funcs.nvEncDestroyEncoder(encoder);
+    cu->cuCtxDestroy(cudaCtx);
+
+    if (cached_caps_valid) {
+        HELPER_LOG("Caps: H264=%u(High10=%u) HEVC=%u(Main10=%u FREXT=%u) AV1=%u(10bit=%u) "
+                   "max H264=%ux%u HEVC=%ux%u AV1=%ux%u",
+                   cached_caps.h264, cached_caps.h264High10,
+                   cached_caps.hevc, cached_caps.hevcMain10, cached_caps.hevcFrext,
+                   cached_caps.av1, cached_caps.av1_10bit,
+                   cached_caps.maxWidthH264, cached_caps.maxHeightH264,
+                   cached_caps.maxWidthHEVC, cached_caps.maxHeightHEVC,
+                   cached_caps.maxWidthAV1, cached_caps.maxHeightAV1);
+    } else {
+        HELPER_LOG("CMD_CAPS: encoder advertised no codecs");
+    }
+
+    *out = cached_caps;
+    return cached_caps_valid;
+}
+
 static void handle_client(int client_fd)
 {
     HelperEncoder enc = {0};
@@ -1143,6 +1210,16 @@ dmabuf_cleanup:
 
             if (ok) {
                 send_response(client_fd, 0, bitstream, bsSize);
+            } else {
+                send_response(client_fd, -1, NULL, 0);
+            }
+            break;
+        }
+
+        case NVENC_IPC_CMD_CAPS: {
+            NVEncIPCCaps caps;
+            if (get_caps(&caps)) {
+                send_response(client_fd, 0, &caps, sizeof(caps));
             } else {
                 send_response(client_fd, -1, NULL, 0);
             }

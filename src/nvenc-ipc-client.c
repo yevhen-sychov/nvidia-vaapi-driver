@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -51,7 +52,19 @@ bool nvenc_ipc_get_socket_path(char *buf, size_t bufsize)
         runtime_dir = "/tmp";
     }
     int ret = snprintf(buf, bufsize, "%s/%s", runtime_dir, NVENC_IPC_SOCK_NAME);
-    return ret > 0 && (size_t)ret < bufsize;
+    if (ret <= 0 || (size_t) ret >= bufsize) {
+        return false;
+    }
+    /* sockaddr_un.sun_path is 108 bytes and both bind() and connect() copy into
+     * it with strncpy, so an over-long XDG_RUNTIME_DIR would silently truncate
+     * to a *different* path -- which shows up as a helper that binds one socket
+     * while the driver connects to another, or as bind() reporting "Address
+     * already in use" for a file nothing appears to hold. Refuse instead. */
+    struct sockaddr_un probe;
+    if ((size_t) ret >= sizeof(probe.sun_path)) {
+        return false;
+    }
+    return true;
 }
 
 int nvenc_ipc_connect(void)
@@ -130,6 +143,88 @@ int nvenc_ipc_connect_or_start(const char *helper_path)
     kill(pid, SIGTERM);
     waitpid(pid, NULL, 0);
     return -1;
+}
+
+const char *nvenc_ipc_find_helper(void)
+{
+    const char *override = getenv("NVD_NVENC_HELPER");
+    if (override != NULL && override[0] != '\0') {
+        return access(override, X_OK) == 0 ? override : NULL;
+    }
+
+    static const char *paths[] = {
+        "/usr/libexec/nvenc-helper",
+        "/usr/local/libexec/nvenc-helper",
+        "/usr/lib/nvidia-vaapi-driver/nvenc-helper",
+        NULL
+    };
+    for (int i = 0; paths[i] != NULL; i++) {
+        if (access(paths[i], X_OK) == 0) {
+            return paths[i];
+        }
+    }
+    return NULL;
+}
+
+int nvenc_ipc_query_caps(NVEncIPCCaps *caps)
+{
+    int fd = nvenc_ipc_connect();
+    if (fd < 0) {
+        const char *helper = nvenc_ipc_find_helper();
+        if (helper == NULL) {
+            return -1;
+        }
+        fd = nvenc_ipc_connect_or_start(helper);
+        if (fd < 0) {
+            return -1;
+        }
+    }
+
+    /* The helper handles one client at a time, so this connection can sit
+     * behind a live encode session for as long as that session runs. A caps
+     * query happens inside vaQueryConfigEntrypoints, which must not block on
+     * someone else's stream -- time out and let the caller use its fallback. */
+    struct timeval tv = { .tv_sec = NVENC_IPC_CAPS_TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    NVEncIPCMsgHeader hdr = { .cmd = NVENC_IPC_CMD_CAPS, .payload_size = 0 };
+    if (!send_all(fd, &hdr, sizeof(hdr))) {
+        close(fd);
+        return -1;
+    }
+
+    NVEncIPCRespHeader resp;
+    if (!recv_all(fd, &resp, sizeof(resp)) || resp.status != 0) {
+        /* status != 0 also covers a helper too old to know CMD_CAPS: its
+         * default branch answers with an error rather than closing. */
+        close(fd);
+        return -1;
+    }
+
+    /* Append-only struct: take the fields we both know, drop any tail the
+     * sender added. A short payload means a sender older than our struct --
+     * zero the remainder rather than reading uninitialised memory. */
+    memset(caps, 0, sizeof(*caps));
+    uint32_t want = resp.payload_size < sizeof(*caps) ? resp.payload_size
+                                                      : (uint32_t) sizeof(*caps);
+    if (want < sizeof(uint32_t) || !recv_all(fd, caps, want)) {
+        close(fd);
+        return -1;
+    }
+    uint32_t remaining = resp.payload_size - want;
+    while (remaining > 0) {
+        char drain[256];
+        uint32_t chunk = remaining < sizeof(drain) ? remaining : (uint32_t) sizeof(drain);
+        if (!recv_all(fd, drain, chunk)) {
+            close(fd);
+            return -1;
+        }
+        remaining -= chunk;
+    }
+
+    close(fd);
+    return 0;
 }
 
 /* Receive a single fd via SCM_RIGHTS */

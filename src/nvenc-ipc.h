@@ -21,6 +21,11 @@
 
 #define NVENC_IPC_SOCK_NAME "nvenc-helper.sock"
 
+/* How long a capability query waits on the helper before giving up. The helper
+ * serves one client at a time, so this bounds how long a vaQueryConfigEntrypoints
+ * call can sit behind somebody else's encode session. */
+#define NVENC_IPC_CAPS_TIMEOUT_SEC 2
+
 /* Maximum frame size we'll accept over the socket (64MB, enough for 8K NV12) */
 #define NVENC_IPC_MAX_FRAME_SIZE (64 * 1024 * 1024)
 
@@ -30,6 +35,7 @@
 #define NVENC_IPC_CMD_CLOSE   3  /* Close encoder and disconnect */
 #define NVENC_IPC_CMD_ENCODE_DMABUF 4  /* Encode from DMA-BUF fd (GPU zero-copy) */
 #define NVENC_IPC_CMD_ENCODE_SHM   5  /* Encode from shared memory (zero-copy host) */
+#define NVENC_IPC_CMD_CAPS    6  /* Query NVENC capabilities of the helper's GPU */
 
 /* Message header (client → helper) */
 typedef struct {
@@ -96,6 +102,36 @@ typedef struct {
     uint32_t shm_size;          /* size of the shared memory region */
 } NVEncIPCInitResponse;
 
+/* CMD_CAPS response payload.
+ *
+ * The driver process cannot enumerate NVENC capabilities itself in encode-only
+ * mode -- it has no CUDA context to open a scratch session on -- so it asks the
+ * helper, which is looking at the same GPU. Without this the driver falls back
+ * to a hardcoded profile list that is right for most cards and wrong for the
+ * rest (it would promise AV1 encode on Turing, for instance).
+ *
+ * Layout is append-only: a receiver reads min(sizeof(local), struct_size) bytes
+ * and drains the rest, so a newer helper talking to an older driver (or the
+ * reverse) degrades to the fields both sides know instead of failing.
+ */
+typedef struct {
+    uint32_t struct_size;       /* sizeof(NVEncIPCCaps) as built by the sender */
+    uint32_t h264;
+    uint32_t h264High10;
+    uint32_t hevc;
+    uint32_t hevcMain10;
+    uint32_t hevcFrext;
+    uint32_t av1;
+    uint32_t av1_10bit;
+    uint32_t inputYUV444;
+    uint32_t inputYUV444_10;
+    uint32_t inputYUV422;
+    uint32_t inputYUV422_10;
+    uint32_t maxWidthH264, maxHeightH264;
+    uint32_t maxWidthHEVC, maxHeightHEVC;
+    uint32_t maxWidthAV1,  maxHeightAV1;
+} NVEncIPCCaps;
+
 /* CMD_ENCODE_SHM payload (frame data is already in shared memory) */
 typedef struct {
     uint32_t width;
@@ -116,6 +152,16 @@ int nvenc_ipc_connect(void);
 
 /* Start the helper if not running, then connect. Returns socket fd or -1. */
 int nvenc_ipc_connect_or_start(const char *helper_path);
+
+/* Path of an installed nvenc-helper binary, or NULL if none is found.
+ * $NVD_NVENC_HELPER overrides the search. The returned string is static. */
+const char *nvenc_ipc_find_helper(void);
+
+/* Ask the helper what its GPU's encoder can do. Connects (starting the helper
+ * if needed), queries, and closes -- it does not hold the connection, because
+ * the helper serves one client at a time and an encode session must not be
+ * blocked behind a capability query. Returns 0 on success. */
+int nvenc_ipc_query_caps(NVEncIPCCaps *caps);
 
 /* Send init command. Returns 0 on success.
  * If shm_fd_out is non-NULL, receives the shared memory fd from the helper.
