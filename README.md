@@ -247,6 +247,27 @@ after**, with the remainder being one-time session setup.
 `tests/test_log_verbosity.sh`, which asserts the log stays bounded by session
 setup rather than growing with frame count.
 
+[Encode-only mode](#encode-only-mode-no-cuda-in-process) has a different set of
+hot sites, and they were missed the first time round because on the CUDA path
+they are genuinely once-per-session calls. A client with no CUDA has to fill
+surfaces through `vaDeriveImage` + host memcpy, so it derives an image *and*
+(depending on the client) allocates a surface for every frame — Steam at 60fps
+was emitting five lines per frame from `vaDeriveImage` and `vaCreateSurfaces2`
+alone. Same treatment: the default log carries the request *shape*
+(`DeriveImage: host image 1920x1080 format 1, 3110400 bytes`) and only when it
+changes, while the per-call detail with its ever-changing surface and image ids
+moved behind `NVD_LOG_VERBOSE=1`.
+
+The IPC transport line got the same fix for the opposite reason. It was
+throttled to the first three frames, which reported the opening state and then
+went silent — backwards, since the event worth seeing is a session that starts
+on shared memory and *falls back* to the socket when a frame outgrows the shm
+region. It is now change-detected, so the fallback prints when it happens.
+
+A 120-frame 1080p60 HEVC encode-only session logs **36 lines, none of them
+per-frame**; `NVD_LOG_VERBOSE=1` gives 335. `test_log_verbosity.sh` runs its
+whole battery a second time in this mode when handed the helper binary.
+
 **Deciding whether to log costs nothing when logging is off.** `LOG()` cannot
 be made a guarded macro — 76 call sites rely on it supplying its own trailing
 semicolon — so it always calls `logger()`, which early-returns when there is no
@@ -883,7 +904,7 @@ Individual harnesses:
 | `tests/test_ffmpeg.sh` | End-to-end ffmpeg + VA-API smoke test. Defaults to `samples/smptebars_h264.mp4` (produced by `samples/gensamples.sh`); override with a positional path argument. |
 | `tests/test_encode_roundtrip.sh` | Encode → software-decode → PSNR roundtrip for each hardware codec (H.264, HEVC, AV1). Reference and decoded output are both dumped to raw yuv420p so no container colorspace-label mismatch pollutes the comparison. Threshold 30 dB — sits solidly between "legit lossy encode at 20 Mbps" (typically 40-70 dB on the fixtures) and "bitstream garbage" (typically low-20s or worse). Two fixtures: the shipped smpte bars, plus a high-frequency testsrc2 stress source generated at test time. Current known failure: `hevc_vaapi` on the stress fixture (RPS reconstruction on the second GOP boundary — see [Known limitations](#known-limitations)). |
 | `tests/test_gstreamer.sh` | End-to-end GStreamer VA-API smoke test. |
-| `tests/test_log_verbosity.sh` | Asserts the encode log stays bounded by session setup rather than growing with frame count, and that `NVD_LOG_VERBOSE=1` still restores the full per-frame detail. See [Encode logging](#encode-logging). |
+| `tests/test_log_verbosity.sh` | Asserts the encode log stays bounded by session setup rather than growing with frame count, and that `NVD_LOG_VERBOSE=1` still restores the full per-frame detail. Runs the battery twice: the CUDA path, then [encode-only mode](#encode-only-mode-no-cuda-in-process), whose hot log sites are different ones (`vaDeriveImage` / `vaCreateSurfaces2`, which only look like once-per-session calls when CUDA is available). See [Encode logging](#encode-logging). |
 | `tests/test_vp8_decode.sh` | VP8 hardware decode vs libvpx, bit-exactness required. Guards the reconstructed uncompressed data chunk — see [VP8 bitstream reconstruction](#vp8-bitstream-reconstruction). Generates its own fixture. |
 | `test_vpp` | `VAEntrypointVideoProc` blit geometry: 1:1, crop, scale, and crop+scale, verified by painting a luma ramp and reading back known pixels. |
 | `test_client_contracts` | The low-level behaviours Chromium/Firefox/FFmpeg depend on and that are easy to break silently: unknown config attributes reported as `VA_ATTRIB_NOT_SUPPORTED`, `vaCreateConfig` with zero attributes, `vaDeriveImage` failing with exactly `VA_STATUS_ERROR_OPERATION_FAILED`, export-before-sync resolving correctly, and the exported descriptor fourcc staying within the set Firefox can import. |

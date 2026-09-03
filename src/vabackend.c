@@ -1716,36 +1716,55 @@ static VAStatus nvCreateSurfaces2(
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
 
-    LOG("nvCreateSurfaces2: %ux%u, format 0x%x, num_surfaces %u", width, height, format, num_surfaces);
-
-    /* Log surface attributes for diagnostics */
+    /* Surface attributes, and the request shape they describe.
+     *
+     * On the CUDA path this is a once-per-session call and logging it outright
+     * costs nothing. A CUDA-less client allocates a surface per frame, so the
+     * same six lines become the bulk of the log -- Steam at 60fps was emitting
+     * four of them per frame. The default log therefore reports the request
+     * shape only when it changes; NVD_LOG_VERBOSE=1 keeps every call, with the
+     * full attribute and external-buffer breakdown. */
     uint32_t memType = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
     VASurfaceAttribExternalBuffers *extBuf = NULL;
     for (unsigned int a = 0; a < num_attribs; a++) {
-        LOG("Surface attrib[%u]: type=%d, flags=0x%x, value_type=%d",
-            a, attrib_list[a].type, attrib_list[a].flags,
-            attrib_list[a].value.type);
+        LOG_DEBUG("Surface attrib[%u]: type=%d, flags=0x%x, value_type=%d",
+                  a, attrib_list[a].type, attrib_list[a].flags,
+                  attrib_list[a].value.type);
         if (attrib_list[a].type == VASurfaceAttribMemoryType &&
             attrib_list[a].value.type == VAGenericValueTypeInteger) {
             memType = attrib_list[a].value.value.i;
-            LOG("  MemoryType: 0x%x", memType);
+            LOG_DEBUG("  MemoryType: 0x%x", memType);
         }
         if (attrib_list[a].type == VASurfaceAttribExternalBufferDescriptor &&
             attrib_list[a].value.type == VAGenericValueTypePointer) {
             extBuf = (VASurfaceAttribExternalBuffers*)attrib_list[a].value.value.p;
             if (extBuf) {
-                LOG("  ExternalBuffers: %ux%u fmt=0x%x planes=%u bufs=%u size=%u",
-                    extBuf->width, extBuf->height, extBuf->pixel_format,
-                    extBuf->num_planes, extBuf->num_buffers, extBuf->data_size);
+                LOG_DEBUG("  ExternalBuffers: %ux%u fmt=0x%x planes=%u bufs=%u size=%u",
+                          extBuf->width, extBuf->height, extBuf->pixel_format,
+                          extBuf->num_planes, extBuf->num_buffers, extBuf->data_size);
                 for (unsigned int b = 0; b < extBuf->num_buffers && b < 4; b++) {
-                    LOG("    buffer[%u] = %lu (fd or ptr)", b, (unsigned long)extBuf->buffers[b]);
+                    LOG_DEBUG("    buffer[%u] = %lu (fd or ptr)", b, (unsigned long)extBuf->buffers[b]);
                 }
                 for (unsigned int p = 0; p < extBuf->num_planes && p < 4; p++) {
-                    LOG("    plane[%u]: pitch=%u offset=%u", p, extBuf->pitches[p], extBuf->offsets[p]);
+                    LOG_DEBUG("    plane[%u]: pitch=%u offset=%u", p, extBuf->pitches[p], extBuf->offsets[p]);
                 }
             }
         }
     }
+
+    if (LOG_ENABLED()) {
+        const NVENCSurfaceRequestLog request = {
+            .width = width, .height = height, .format = format,
+            .numSurfaces = num_surfaces, .memType = memType,
+            .numAttribs = num_attribs,
+        };
+        if (nvenc_log_state_changed(&drv->loggedSurfaceRequest, &request, sizeof(request))) {
+            LOG("nvCreateSurfaces2: %ux%u, format 0x%x, num_surfaces %u, memType 0x%x, %u attrib(s)",
+                width, height, format, num_surfaces, memType, num_attribs);
+        }
+    }
+    LOG_DEBUG("nvCreateSurfaces2: %ux%u, format 0x%x, num_surfaces %u",
+              width, height, format, num_surfaces);
     ImportedSurface imported;
     parseSurfaceImportAttributes(attrib_list, num_attribs, &imported);
     const bool importSurface = imported.valid;

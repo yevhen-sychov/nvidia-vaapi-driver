@@ -567,6 +567,32 @@ VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx)
     return VA_STATUS_SUCCESS;
 }
 
+/* Which transport carried this frame, logged only when it changes.
+ *
+ * The choice is made per frame, so the previous "log the first three frames"
+ * throttle reported the opening state and then went silent -- exactly backwards
+ * for the case worth seeing, which is a session that starts on shm and falls
+ * back to the socket when a frame outgrows the shared region. */
+static void nvenc_log_ipc_transport(NVENCContext *nvencCtx, NVENCIPCTransport transport,
+                                    uint32_t width, uint32_t height, uint32_t size)
+{
+    if (!LOG_ENABLED()) {
+        return;
+    }
+    const NVENCIPCTransportLog now = {
+        .transport = (int32_t) transport,
+        .width = width, .height = height, .size = size,
+    };
+    if (!nvenc_log_state_changed(&nvencCtx->loggedIPCTransport, &now, sizeof(now))) {
+        return;
+    }
+    const char *name = transport == NVENC_IPC_TRANSPORT_SHM    ? "SHM"
+                     : transport == NVENC_IPC_TRANSPORT_SOCKET ? "SOCKET"
+                     : transport == NVENC_IPC_TRANSPORT_DMABUF ? "DMABUF"
+                     : "?";
+    LOG("IPC encode: %s path %ux%u %u bytes", name, width, height, size);
+}
+
 /* IPC encode path: send frame data to 64-bit helper, receive bitstream */
 static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
 {
@@ -722,9 +748,8 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
             if (surface->hostPixelData != nvencCtx->shmPtr) {
                 memcpy(nvencCtx->shmPtr, surface->hostPixelData, frameSize);
             }
-            if (nvencCtx->frameCount < 3) {
-                LOG("IPC encode: SHM path %ux%u %u bytes", surfW, surfH, frameSize);
-            }
+            nvenc_log_ipc_transport(nvencCtx, NVENC_IPC_TRANSPORT_SHM,
+                                    surfW, surfH, frameSize);
             ret = nvenc_ipc_encode_shm(nvencCtx->ipcFd, surfW, surfH,
                                         frameSize, forceIDR, temporalId, picType,
                                         &bitstream, &bsSize);
@@ -735,20 +760,19 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
                 return VA_STATUS_ERROR_ALLOCATION_FAILED;
             }
             memcpy(snapshot, surface->hostPixelData, frameSize);
-            if (nvencCtx->frameCount < 3) {
-                LOG("IPC encode: SOCKET path %ux%u %u bytes", surfW, surfH, frameSize);
-            }
+            nvenc_log_ipc_transport(nvencCtx, NVENC_IPC_TRANSPORT_SOCKET,
+                                    surfW, surfH, frameSize);
             ret = nvenc_ipc_encode(nvencCtx->ipcFd, snapshot,
                                     surfW, surfH, frameSize, forceIDR, temporalId, picType,
                                     &bitstream, &bsSize);
             free(snapshot);
         }
     } else if (useDmaBuf) {
-        if (nvencCtx->frameCount < 3) {
-            LOG("IPC encode: DMABUF planes=%d fds=[%d,%d] %ux%u pitch=%u sizes=[%u,%u]",
-                num_dmabuf_fds, dmabuf_fds[0], dmabuf_fds[1],
-                dp.width, dp.height, dp.pitches[0], dp.sizes[0], dp.sizes[1]);
-        }
+        nvenc_log_ipc_transport(nvencCtx, NVENC_IPC_TRANSPORT_DMABUF,
+                                dp.width, dp.height, dp.sizes[0]);
+        LOG_DEBUG("IPC encode: DMABUF planes=%d fds=[%d,%d] %ux%u pitch=%u sizes=[%u,%u]",
+                  num_dmabuf_fds, dmabuf_fds[0], dmabuf_fds[1],
+                  dp.width, dp.height, dp.pitches[0], dp.sizes[0], dp.sizes[1]);
         ret = nvenc_ipc_encode_dmabuf(nvencCtx->ipcFd, dmabuf_fds, num_dmabuf_fds,
                                        &dp, &bitstream, &bsSize);
     } else {
@@ -779,12 +803,15 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
         memcpy(coded->bitstreamData, bitstream, bsSize);
         coded->bitstreamSize = bsSize;
         coded->hasData = true;
-        if (nvencCtx->frameCount < 5 || nvencCtx->frameCount % 300 == 0) {
+        /* Pure per-frame progress: no "changed" state to key off, so it goes
+         * behind NVD_LOG_VERBOSE like the CUDA path's equivalent. Phrased to
+         * match it so one grep covers both. Use NVD_STATS=1 for throughput. */
+        if (nvdLogDebugEnabled()) {
             unsigned char *bs = (unsigned char *)coded->bitstreamData;
-            LOG("IPC encode: frame %lu, %u bytes, first4=[%02x %02x %02x %02x]",
-                (unsigned long)nvencCtx->frameCount, bsSize,
-                bsSize > 0 ? bs[0] : 0, bsSize > 1 ? bs[1] : 0,
-                bsSize > 2 ? bs[2] : 0, bsSize > 3 ? bs[3] : 0);
+            LOG_DEBUG("IPC encode: frame %lu encoded, %u bytes, first4=[%02x %02x %02x %02x]",
+                      (unsigned long)nvencCtx->frameCount, bsSize,
+                      bsSize > 0 ? bs[0] : 0, bsSize > 1 ? bs[1] : 0,
+                      bsSize > 2 ? bs[2] : 0, bsSize > 3 ? bs[3] : 0);
         }
     }
 
@@ -1086,8 +1113,23 @@ VAStatus nvenc_dispatch_derive_image_hostmem(NVDriver *drv, NVSurface *surfaceOb
     image->offsets[0] = 0;
     image->offsets[1] = lumaSize;
 
-    LOG("DeriveImage: surface %d → host image %d (%ux%u, %u bytes)",
-        surface, imageObj->id, width, height, totalSize);
+    /* A CUDA-less client derives an image per frame -- that is how it gets
+     * pixels into a surface at all -- so this is a hot path, not the
+     * once-per-session call it is on the CUDA side. The ids are new every
+     * frame and the shape is not, so the default log carries the shape and
+     * only when it changes; NVD_LOG_VERBOSE=1 keeps the per-call detail. */
+    if (LOG_ENABLED()) {
+        const NVENCHostImageLog shape = {
+            .width = width, .height = height, .size = totalSize,
+            .format = (int32_t) img->format,
+        };
+        if (nvenc_log_state_changed(&drv->loggedHostImage, &shape, sizeof(shape))) {
+            LOG("DeriveImage: host image %ux%u format %d, %u bytes",
+                width, height, img->format, totalSize);
+        }
+    }
+    LOG_DEBUG("DeriveImage: surface %d → host image %d (%ux%u, %u bytes)",
+              surface, imageObj->id, width, height, totalSize);
     return VA_STATUS_SUCCESS;
 }
 

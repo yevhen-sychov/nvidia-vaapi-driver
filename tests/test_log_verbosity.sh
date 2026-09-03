@@ -13,8 +13,16 @@ set -u
 # The per-frame sites now either log only when their values change, or sit
 # behind NVD_LOG_VERBOSE=1. This asserts both halves: quiet by default, and
 # still fully recoverable when asked.
+#
+# Runs twice where possible. The CUDA path is the obvious one. Encode-only mode
+# (no CUDA in-process -- see tests/test_encode_only.sh) has a *different* set of
+# hot sites: a client with no CUDA derives a host image and allocates a surface
+# per frame, so vaDeriveImage and vaCreateSurfaces2 -- once-per-session calls on
+# the CUDA path, and logged outright for that reason -- turn into the bulk of
+# the log. That half needs the nvenc-helper binary as $1; without it, skipped.
 
 export LIBVA_DRIVER_NAME=nvidia
+HELPER_BIN=${1:-}
 
 PASS=0
 FAIL=0
@@ -121,6 +129,90 @@ if encode "" NVD_LOG_VERBOSE=1 && [ "$(frame_count "$TMPDIR/out.mp4")" = "$FRAME
     pass "NVD_LOG_VERBOSE without NVD_LOG is inert"
 else
     fail "NVD_LOG_VERBOSE without NVD_LOG is inert" "encode did not complete cleanly"
+fi
+
+# --- Encode-only mode ---------------------------------------------------
+#
+# CUDA_VISIBLE_DEVICES="" makes cuInit() fail, which is what a 32-bit client
+# sees on a GPU whose CUDA support is 64-bit only. The encode then runs through
+# the helper, and the per-frame log sites are the host-image and surface ones
+# rather than the CUDA copy path.
+
+if [ -z "$HELPER_BIN" ] || [ ! -x "$HELPER_BIN" ]; then
+    skip "encode-only mode log volume" "no nvenc-helper binary passed"
+else
+    RUNTIME_DIR=$(mktemp -d /tmp/nvd-logverb.XXXXXX)
+    chmod 700 "$RUNTIME_DIR"
+    env -u CUDA_VISIBLE_DEVICES XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+        "$HELPER_BIN" --foreground >"$RUNTIME_DIR/helper.log" 2>&1 &
+    HELPER_PID=$!
+    trap 'kill "$HELPER_PID" 2>/dev/null; rm -rf "$TMPDIR" "$RUNTIME_DIR"' EXIT
+    for _ in $(seq 1 50); do
+        [ -S "$RUNTIME_DIR/nvenc-helper.sock" ] && break
+        sleep 0.1
+    done
+
+    encode_eo() { # $1 = log file, rest = extra env assignments
+        local log="$1"; shift
+        env NVD_LOG="$log" CUDA_VISIBLE_DEVICES="" \
+            XDG_RUNTIME_DIR="$RUNTIME_DIR" NVD_NVENC_HELPER="$HELPER_BIN" "$@" \
+            ffmpeg -hide_banner -loglevel error -vaapi_device /dev/dri/renderD128 \
+            -i "$SRC" -frames:v "$FRAMES" -vf 'format=nv12,hwupload' \
+            -c:v h264_vaapi -b:v 4M -y "$TMPDIR/out_eo.mp4" >"$TMPDIR/ff_eo.log" 2>&1
+    }
+
+    if ! encode_eo "$TMPDIR/eo_quiet.log"; then
+        fail "encode-only hardware encode for log measurement" "ffmpeg error"
+        cat "$TMPDIR/ff_eo.log"
+    elif ! grep -q "encode-only mode" "$TMPDIR/eo_quiet.log"; then
+        skip "encode-only mode log volume" "CUDA initialised anyway; mode unreachable"
+    else
+        EO_TOTAL=$(wc -l < "$TMPDIR/eo_quiet.log")
+        EO_DERIVE=$(grep -cE 'DeriveImage: surface [0-9]+' "$TMPDIR/eo_quiet.log")
+        EO_SURF=$(grep -cE 'Surface attrib\[' "$TMPDIR/eo_quiet.log")
+        EO_FRAME=$(grep -cE 'frame [0-9]+ encoded' "$TMPDIR/eo_quiet.log")
+
+        if [ "$EO_DERIVE" -eq 0 ]; then
+            pass "per-call DeriveImage detail is not logged by default"
+        else
+            fail "per-call DeriveImage detail is not logged by default" \
+                 "${EO_DERIVE} lines for ${FRAMES} frames"
+        fi
+
+        if [ "$EO_SURF" -eq 0 ]; then
+            pass "per-call surface attributes are not logged by default"
+        else
+            fail "per-call surface attributes are not logged by default" \
+                 "${EO_SURF} lines for ${FRAMES} frames"
+        fi
+
+        if [ "$EO_FRAME" -eq 0 ]; then
+            pass "encode-only per-frame progress is not logged by default"
+        else
+            fail "encode-only per-frame progress is not logged by default" \
+                 "${EO_FRAME} lines leaked to the default log level"
+        fi
+
+        if [ "$EO_TOTAL" -lt "$FRAMES" ]; then
+            pass "encode-only log does not scale with frames (${EO_TOTAL} / ${FRAMES})"
+        else
+            fail "encode-only log does not scale with frames" \
+                 "${EO_TOTAL} lines for ${FRAMES} frames"
+        fi
+
+        if encode_eo "$TMPDIR/eo_verbose.log" NVD_LOG_VERBOSE=1; then
+            EO_V_DERIVE=$(grep -cE 'DeriveImage: surface [0-9]+' "$TMPDIR/eo_verbose.log")
+            EO_V_FRAME=$(grep -cE 'frame [0-9]+ encoded' "$TMPDIR/eo_verbose.log")
+            if [ "$EO_V_DERIVE" -ge "$FRAMES" ] && [ "$EO_V_FRAME" -ge "$FRAMES" ]; then
+                pass "NVD_LOG_VERBOSE=1 restores encode-only detail (${EO_V_DERIVE}/${EO_V_FRAME})"
+            else
+                fail "NVD_LOG_VERBOSE=1 restores encode-only detail" \
+                     "DeriveImage=${EO_V_DERIVE} frame=${EO_V_FRAME} for ${FRAMES} frames"
+            fi
+        else
+            fail "encode-only verbose run" "ffmpeg error"
+        fi
+    fi
 fi
 
 echo ""

@@ -169,6 +169,28 @@ typedef struct {
     void (*destroyAllBackingImage)(struct _NVDriver *drv);
 } NVBackend;
 
+/*
+ * Per-call log state for the two sites a CUDA-less client drives once per
+ * frame. Same idea as the NVENC*Log family in nvenc.h -- keep what was last
+ * printed, print only on a difference -- but these hang off NVDriver rather
+ * than an encode context, so they have to be declared here: nvenc.h includes
+ * this header, not the other way round.
+ *
+ * vaDeriveImage and vaCreateSurfaces2 are once-per-session calls on the CUDA
+ * path, which is why they were logged unconditionally. In encode-only mode a
+ * client derives an image and allocates a surface for every frame, so the same
+ * two lines turn into the bulk of the log.
+ */
+typedef struct {
+    uint32_t width, height, size;
+    int32_t  format;
+} NVENCHostImageLog;
+
+typedef struct {
+    uint32_t width, height, format, numSurfaces, memType;
+    uint32_t numAttribs;
+} NVENCSurfaceRequestLog;
+
 typedef struct _NVDriver
 {
     CudaFunctions           *cu;
@@ -227,6 +249,11 @@ typedef struct _NVDriver
      */
     bool                    nvencCapsProbed;
     bool                    nvencCapsValid;
+    /* Last-logged shapes for the two per-call sites that a CUDA-less client
+     * drives once per frame -- see the typedefs above nvCreateSurfaces2's
+     * cousins in nvenc.h for the rest of this family. */
+    NVENCHostImageLog       loggedHostImage;
+    NVENCSurfaceRequestLog  loggedSurfaceRequest;
     bool                    nvencSupportsH264;
     bool                    nvencSupportsH264High10;
     bool                    nvencSupportsHEVC;

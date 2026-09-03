@@ -256,7 +256,8 @@ if not meson.is_cross_build()
         # Sets NVD_LOG itself, so it does not inherit test_env's NVD_LOG=1.
         test('log_verbosity',
              find_program('tests/test_log_verbosity.sh'),
-             timeout : 120,
+             args : have_nvenc_helper ? [nvenc_helper] : [],
+             timeout : 180,
              env : {
                  'LIBVA_DRIVER_NAME': 'nvidia',
                  'LIBVA_DRIVERS_PATH': meson.project_build_root(),

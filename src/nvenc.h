@@ -50,6 +50,27 @@ typedef struct {
     int32_t  imgFormat, bitDepth, encFormat;
 } NVENCGeometryLog;
 
+/* Which transport carried the frame to the helper, and its shape. Kept per
+ * encode context: the transport is chosen per frame (shm when the frame fits
+ * the shared region, socket otherwise, DMA-BUF for GPU-backed surfaces), so a
+ * mid-session fall back from shm to socket is a real event worth seeing --
+ * which is precisely what the previous "log the first 3 frames" throttle hid. */
+typedef struct {
+    int32_t  transport;              /* NVENCIPCTransport */
+    uint32_t width, height, size;
+} NVENCIPCTransportLog;
+
+typedef enum {
+    NVENC_IPC_TRANSPORT_NONE = 0,
+    NVENC_IPC_TRANSPORT_SHM,
+    NVENC_IPC_TRANSPORT_SOCKET,
+    NVENC_IPC_TRANSPORT_DMABUF,
+} NVENCIPCTransport;
+
+/* NVENCHostImageLog and NVENCSurfaceRequestLog live in vabackend.h -- they
+ * hang off NVDriver, which is declared there, and that header cannot include
+ * this one. */
+
 typedef struct {
     void                           *encoder;        //NVENC session handle
     NV_ENCODE_API_FUNCTION_LIST     funcs;
@@ -134,6 +155,7 @@ typedef struct {
     NVENCRateLog                    loggedRate;
     NVENCFrameRateLog               loggedFrameRate;
     NVENCGeometryLog                loggedGeometry;
+    NVENCIPCTransportLog            loggedIPCTransport;
 } NVENCContext;
 
 // Wraps VACodedBufferSegment with NVENC bitstream storage
