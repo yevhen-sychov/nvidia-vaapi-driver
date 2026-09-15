@@ -180,6 +180,13 @@ void nvGetConfigAttributesEncode(
         case VAConfigAttribEncAV1Ext1:
             if (profile == VAProfileAV1Profile0) {
                 VAConfigAttribValEncAV1Ext1 v = { .value = 0 };
+                /* libva defines this as a bitmask of 1 << VA_SEGID_BLOCK_*, but
+                 * Chromium's AV1VaapiVideoEncoderDelegate uses the raw byte as a
+                 * block size and divides the frame width by it, so leaving it 0
+                 * crashes the GPU process with SIGFPE. 8 is (1 << VA_SEGID_BLOCK_8X8)
+                 * under libva's reading and a valid AV1 block size under
+                 * Chromium's. NVENC ignores client segment maps either way. */
+                v.bits.min_segid_block_size_accepted = 1 << VA_SEGID_BLOCK_8X8;
                 v.bits.interpolation_filter = 0x1f;
                 v.bits.segment_feature_support = 0xff;
                 attrib_list[i].value = v.value;
