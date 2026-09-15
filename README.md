@@ -36,6 +36,7 @@ including the Steam Remote Play integration path. Everything below labelled as
   - [Quick install from this fork](#quick-install-from-this-fork)
   - [Packaging status](#packaging-status)
   - [Building](#building)
+    - [Building with Nix](#building-with-nix)
   - [Removal](#removal)
 - [Configuration](#configuration)
   - [Upstream regressions](#upstream-regressions)
@@ -513,6 +514,57 @@ Then run the following commands:
 meson setup build
 meson install -C build
 ```
+
+### Building with Nix
+
+A flake is checked in, so with Nix (flakes enabled) you don't need any of the
+distro packages above:
+
+```sh
+nix build          # -> result/lib/dri/nvidia_drv_video.so, result/libexec/nvenc-helper
+nix develop        # dev shell: meson, ninja, pkg-config, ffmpeg, vainfo, gst-launch-1.0, gdb
+nix flake check    # builds the driver
+```
+
+Inside `nix develop` the normal meson workflow applies (`meson setup build &&
+meson compile -C build && meson test -C build`).
+
+A few things worth knowing about the flake:
+
+* **It builds its own `nv-codec-headers`.** nixpkgs stops at 12.1, which
+  predates `NV_ENC_BUFFER_FORMAT_P210` and the rest of the NVENC 13 API this
+  fork uses, so `nix/nv-codec-headers.nix` pins 13.0.19.1 — the same series
+  Fedora ships. Headers *newer* than your installed NVIDIA driver make
+  `nvEncOpenEncodeSessionEx` fail with `NV_ENC_ERR_INVALID_VERSION`, so if you
+  run an older driver, override them:
+
+  ```nix
+  nvidia-vaapi-driver.override { nvCodecHeaders = pkgs.nv-codec-headers-12; }
+  ```
+
+* **The driver installs to `$out/lib/dri`,** not to libva's `driverdir` (a
+  read-only store path). On NixOS that is exactly what
+  `hardware.graphics.extraPackages` expects; elsewhere point
+  `LIBVA_DRIVERS_PATH` at it.
+
+* **`libcuda.so.1` / `libnvcuvid.so.1` / `libnvidia-encode.so.1` are dlopened
+  at runtime** and resolved through `/run/opengl-driver/lib`, which only exists
+  on NixOS. On a non-NixOS host either symlink it
+  (`sudo mkdir -p /run/opengl-driver && sudo ln -s /usr/lib64 /run/opengl-driver/lib`)
+  or point `LD_LIBRARY_PATH` at your driver libraries:
+
+  ```sh
+  LIBVA_DRIVER_NAME=nvidia LIBVA_DRIVERS_PATH=$PWD/result/lib/dri \
+    LD_LIBRARY_PATH=/usr/lib64 \
+    vainfo --display drm --device /dev/dri/renderD128
+  ```
+
+  Same for the encode helper — run it (or point `NVD_NVENC_HELPER` at it) from
+  `result/libexec/nvenc-helper`; see [NVENC encode helper](#nvenc-encode-helper).
+
+* **The meson test suite is not part of the build.** It drives a real NVENC /
+  NVDEC engine through `/dev/dri/renderD128`, which the Nix sandbox has no
+  access to, so `doCheck = false`; run `meson test` from `nix develop` instead.
 
 ## Removal
 

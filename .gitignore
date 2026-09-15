@@ -11,3 +11,7 @@ va-api-nvidia.files
 va-api-nvidia.includes
 meson.build.user
 .idea
+
+# nix build output
+result
+result-*
