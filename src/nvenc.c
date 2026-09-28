@@ -609,22 +609,25 @@ int nvenc_encode_frame(NVENCContext *nvencCtx, NV_ENC_INPUT_PTR inputBuffer,
     picParams.pictureType = picType;
     if (nvencCtx->frameCount == 0 || (picFlags & NV_ENC_PIC_FLAG_FORCEIDR)) {
         picParams.pictureType = NV_ENC_PIC_TYPE_IDR;
+        //the POC restarts at every IDR; see NVENCContext::idrFrameCount
+        nvencCtx->idrFrameCount = nvencCtx->frameCount;
     } else if (picParams.pictureType == NV_ENC_PIC_TYPE_UNKNOWN) {
         picParams.pictureType = NV_ENC_PIC_TYPE_P;
     }
+    const uint32_t displayPOC = (uint32_t)((nvencCtx->frameCount - nvencCtx->idrFrameCount) * 2);
     picParams.encodePicFlags = picFlags;
     picParams.frameIdx = (uint32_t)nvencCtx->frameCount;
     picParams.inputTimeStamp = nvencCtx->frameCount;
 
     if (memcmp(&nvencCtx->codecGuid, &NV_ENC_CODEC_H264_GUID, sizeof(GUID)) == 0) {
-        picParams.codecPicParams.h264PicParams.displayPOCSyntax = (uint32_t)(nvencCtx->frameCount * 2);
+        picParams.codecPicParams.h264PicParams.displayPOCSyntax = displayPOC;
         picParams.codecPicParams.h264PicParams.refPicFlag = 1;
     } else if (memcmp(&nvencCtx->codecGuid, &NV_ENC_CODEC_HEVC_GUID, sizeof(GUID)) == 0) {
-        picParams.codecPicParams.hevcPicParams.displayPOCSyntax = (uint32_t)(nvencCtx->frameCount * 2);
+        picParams.codecPicParams.hevcPicParams.displayPOCSyntax = displayPOC;
         picParams.codecPicParams.hevcPicParams.refPicFlag = 1;
         picParams.codecPicParams.hevcPicParams.temporalId = nvencCtx->temporalId;
     } else if (memcmp(&nvencCtx->codecGuid, &NV_ENC_CODEC_AV1_GUID, sizeof(GUID)) == 0) {
-        picParams.codecPicParams.av1PicParams.displayPOCSyntax = (uint32_t)(nvencCtx->frameCount * 2);
+        picParams.codecPicParams.av1PicParams.displayPOCSyntax = displayPOC;
         picParams.codecPicParams.av1PicParams.refPicFlag = 1;
         picParams.codecPicParams.av1PicParams.temporalId = nvencCtx->temporalId;
         if (nvencCtx->frameCount < 5) {

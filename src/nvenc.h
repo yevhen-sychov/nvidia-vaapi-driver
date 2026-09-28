@@ -94,6 +94,11 @@ typedef struct {
     uint32_t                        vbvBufferSize;  //HRD buffer size (bits)
     uint32_t                        vbvInitialDelay; //HRD initial fullness (bits)
     uint64_t                        frameCount;
+    /* frameCount at the last IDR. With enablePTD=0 the client owns the picture
+     * type, so NVENC expects us to supply the POC as well, and the POC restarts
+     * at every IDR. Counting it from the first frame instead left later GOPs
+     * referencing POCs the decoder had never seen. */
+    uint64_t idrFrameCount;
     NVENCOutputBuffer               outputBuffer;
     VABufferID                      currentCodedBufId;
     bool                            forceIDR;       //from idr_pic_flag
