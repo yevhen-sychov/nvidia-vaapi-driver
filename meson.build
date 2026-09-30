@@ -250,6 +250,17 @@ if not meson.is_cross_build()
              timeout : 120,
              env : test_env)
 
+        # AV1 streams whose frames are coded smaller than the sequence
+        # maximum (frame_size_override_flag) — what hardware encoders emit
+        # for 1080p/2160p, since they pad to 16-pixel blocks. The driver has
+        # to pass the real frame size, and each reference's real size, to
+        # NVDEC; getting it wrong corrupts everything after a keyframe.
+        # Generates its own fixture with SVT-AV1's forced-max-frame-height.
+        test('av1_frame_size_override',
+             find_program('tests/test_av1_frame_size_override.sh'),
+             timeout : 120,
+             env : test_env)
+
         # The encode log must stay bounded by session setup rather than
         # growing with frame count -- per-frame chatter buries the events
         # that matter (resolution/bitrate changes, reconfigures, errors).
