@@ -2584,17 +2584,6 @@ static VAStatus nvCreateBuffer(
         return VA_STATUS_SUCCESS;
     }
 
-    /* VP8 note: VA-API hands us slice data that begins at the first partition,
-     * with the VP8 "uncompressed data chunk" (frame tag, plus sync code and
-     * dimensions on a keyframe) already stripped — but NVDEC still expects it
-     * at the head of the bitstream. This used to be recovered by rewinding the
-     * client's pointer to the previous 16-byte boundary and reading whatever
-     * was there; see copyVP8SliceData() in src/vp8.c for why that was both a
-     * read behind a buffer we do not own and wrong in practice. The chunk is
-     * now reconstructed from the VA-API parameters instead, so nothing special
-     * happens here. */
-    const size_t offset = 0;
-
     //TODO should pool these as most of the time these should be the same size
     Object bufferObject = nvAllocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
     *buf_id = bufferObject->id;
@@ -2603,8 +2592,12 @@ static VAStatus nvCreateBuffer(
     buf->bufferType = type;
     buf->elements = num_elements;
     buf->size = num_elements * size;
+    // NB: the buffer always starts at the client's data. This used to walk
+    // backwards from the client's pointer to recover the VP8 frame header that
+    // lives in front of the slice data, which read unrelated memory and made
+    // NVDEC decode every VP8 frame to a single constant image.
     buf->ptr = memalign(16, buf->size);
-    buf->offset = offset;
+    buf->offset = 0;
 
     if (buf->ptr == NULL) {
         LOG("Unable to allocate buffer of %zu bytes", buf->size);

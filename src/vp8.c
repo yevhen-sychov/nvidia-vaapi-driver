@@ -1,8 +1,21 @@
 #include "vabackend.h"
 
+/* Size of the VP8 "uncompressed data chunk" that the client keeps out of the
+ * slice data buffer and instead describes through the picture parameter
+ * buffer:
+ *   key frame   : frame tag (3 bytes) + key frame header (start code, width,
+ *                 height) = 10 bytes
+ *   inter frame : frame tag (3 bytes)
+ * NVDEC expects the complete frame, so the driver has to rebuild that header
+ * from the VA-API parameters before handing the partitions to the decoder. */
+#define VP8_UNCOMPRESSED_CHUNK_KEYFRAME   10
+#define VP8_UNCOMPRESSED_CHUNK_INTERFRAME  3
+#define VP8_KEYFRAME_STARTCODE0 0x9d
+#define VP8_KEYFRAME_STARTCODE1 0x01
+#define VP8_KEYFRAME_STARTCODE2 0x2a
+
 static void copyVP8PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *picParams)
 {
-    //Untested, my 1060 (GP106) doesn't support this, however it's simple enough that it should work
     VAPictureParameterBufferVP8* buf = (VAPictureParameterBufferVP8*) buffer->ptr;
 
     picParams->PicWidthInMbs    = (buf->frame_width + 15) / 16;
@@ -17,7 +30,12 @@ static void copyVP8PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
 
     picParams->CodecSpecific.vp8.vp8_frame_tag.frame_type = buf->pic_fields.bits.key_frame;
     picParams->CodecSpecific.vp8.vp8_frame_tag.version = buf->pic_fields.bits.version;
-    picParams->CodecSpecific.vp8.vp8_frame_tag.show_frame = 1;//?
+    /* VA-API has no show_frame bit, and it is not part of the slice data the
+     * client submits. Decoded frames are displayable frames unless the client
+     * uses the frame purely as a reference, so report it as shown. Reading bit
+     * 4 of the first partition byte (what this used to do) yields a garbage
+     * value because that byte is token data, not a frame tag. */
+    picParams->CodecSpecific.vp8.vp8_frame_tag.show_frame = 1;
     picParams->CodecSpecific.vp8.vp8_frame_tag.update_mb_segmentation_data = buf->pic_fields.bits.segmentation_enabled ? buf->pic_fields.bits.update_segment_feature_data : 0;
 }
 
@@ -25,6 +43,8 @@ static void copyVP8SliceParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *
 {
     VASliceParameterBufferVP8* buf = (VASliceParameterBufferVP8*) buffer->ptr;
 
+    // VA-API reports the first partition size excluding the uncompressed data
+    // chunk, which is exactly the first_part_size field of the VP8 frame tag.
     picParams->CodecSpecific.vp8.first_partition_size = buf->partition_size[0] + ((buf->macroblock_offset + 7) / 8);
 
     ctx->lastSliceParams = buffer->ptr;
@@ -33,82 +53,62 @@ static void copyVP8SliceParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *
     picParams->nNumSlices += buffer->elements;
 }
 
-/* Rebuild the VP8 "uncompressed data chunk" (RFC 6386 §9.1) that VA-API strips
- * before handing us slice data, but that NVDEC still expects at the head of the
- * bitstream.
- *
- * Layout, all little-endian:
- *   3-byte frame tag: bit 0 frame_type (0 = key), bits 1-3 version,
- *                     bit 4 show_frame, bits 5-23 first_part_size
- *   keyframes only:   3-byte sync code 9d 01 2a,
- *                     16-bit width  | horizontal_scale << 14,
- *                     16-bit height | vertical_scale   << 14
- *
- * Every field comes from the VA-API buffers we were given: frame_type, version
- * and the dimensions from VAPictureParameterBufferVP8, and first_part_size from
- * VASliceParameterBufferVP8 (copyVP8SliceParam already derives it as
- * partition_size[0] + ceil(macroblock_offset / 8), which reproduces the real
- * frame tag's field exactly).
- *
- * The one field VA-API does not carry is show_frame. Upstream read it out of
- * the frame tag it recovered from memory before the buffer; we default it to 1,
- * matching what copyVP8PicParam already assumes. A decoder is only asked to
- * decode frames the client intends to use, and NVDEC is told the same value
- * through CUVIDPICPARAMS.CodecSpecific.vp8.vp8_frame_tag, so the synthesized
- * byte stays consistent with the struct.
- *
- * Returns the number of bytes written into `out` (3 or 10). */
-static size_t buildVP8UncompressedChunk(const CUVIDPICPARAMS *picParams, uint8_t out[10])
-{
-    const uint32_t frameType = picParams->CodecSpecific.vp8.vp8_frame_tag.frame_type;
-    const uint32_t version = picParams->CodecSpecific.vp8.vp8_frame_tag.version;
-    const uint32_t showFrame = picParams->CodecSpecific.vp8.vp8_frame_tag.show_frame;
-    const uint32_t firstPartSize = picParams->CodecSpecific.vp8.first_partition_size;
-
-    const uint32_t tag = (frameType & 0x1)
-                       | ((version & 0x7) << 1)
-                       | ((showFrame & 0x1) << 4)
-                       | ((firstPartSize & 0x7ffff) << 5);
-
-    out[0] = (uint8_t) (tag & 0xff);
-    out[1] = (uint8_t) ((tag >> 8) & 0xff);
-    out[2] = (uint8_t) ((tag >> 16) & 0xff);
-
-    if (frameType != 0) {
-        return 3; //interframe: frame tag only
-    }
-
-    const uint32_t width = picParams->CodecSpecific.vp8.width;
-    const uint32_t height = picParams->CodecSpecific.vp8.height;
-
-    out[3] = 0x9d;
-    out[4] = 0x01;
-    out[5] = 0x2a;
-    //scale fields are 0: VA-API carries no upscaling factor, and the decoded
-    //size is already the coded size we were handed.
-    out[6] = (uint8_t) (width & 0xff);
-    out[7] = (uint8_t) ((width >> 8) & 0x3f);
-    out[8] = (uint8_t) (height & 0xff);
-    out[9] = (uint8_t) ((height >> 8) & 0x3f);
-
-    return 10;
-}
-
 static void copyVP8SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)
 {
-    uint8_t chunk[10];
-    const size_t chunkSize = buildVP8UncompressedChunk(picParams, chunk);
+    if (ctx->lastSliceParamsCount == 0) {
+        LOG("VP8 slice data without slice parameters");
+        return;
+    }
+
+    bool isKeyFrame = (picParams->CodecSpecific.vp8.vp8_frame_tag.frame_type == 0);
+    size_t headerSize = isKeyFrame ? VP8_UNCOMPRESSED_CHUNK_KEYFRAME : VP8_UNCOMPRESSED_CHUNK_INTERFRAME;
+
+    // Rebuild the frame tag: frame_type, version, show_frame and the 19 bit
+    // first_part_size (least significant bit first, see RFC 6386 9.1).
+    uint32_t firstPartitionSize = picParams->CodecSpecific.vp8.first_partition_size;
+    uint8_t frameTag[VP8_UNCOMPRESSED_CHUNK_KEYFRAME] = {0};
+
+    frameTag[0] = (uint8_t) ((isKeyFrame ? 0 : 0x01) |
+                             (picParams->CodecSpecific.vp8.vp8_frame_tag.version << 1) |
+                             (picParams->CodecSpecific.vp8.vp8_frame_tag.show_frame << 4) |
+                             ((firstPartitionSize & 0x7) << 5));
+    frameTag[1] = (uint8_t) ((firstPartitionSize >> 3) & 0xff);
+    frameTag[2] = (uint8_t) ((firstPartitionSize >> 11) & 0xff);
+
+    if (isKeyFrame) {
+        frameTag[3] = VP8_KEYFRAME_STARTCODE0;
+        frameTag[4] = VP8_KEYFRAME_STARTCODE1;
+        frameTag[5] = VP8_KEYFRAME_STARTCODE2;
+        uint32_t width = (uint32_t) picParams->CodecSpecific.vp8.width & 0x7fff;
+        uint32_t height = (uint32_t) picParams->CodecSpecific.vp8.height & 0x7fff;
+        frameTag[6] = (uint8_t) (width & 0xff);
+        frameTag[7] = (uint8_t) ((width >> 8) & 0xff);
+        frameTag[8] = (uint8_t) (height & 0xff);
+        frameTag[9] = (uint8_t) ((height >> 8) & 0xff);
+    }
 
     for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++)
     {
         VASliceParameterBufferVP8 *sliceParams = &((VASliceParameterBufferVP8*) ctx->lastSliceParams)[i];
+
+        // Only ever read inside the buffer the client gave us: reading before
+        // the buffer (which this driver used to do to recover the frame header)
+        // returned unrelated memory and made every frame decode to garbage.
+        if ((uint64_t) sliceParams->slice_data_offset + sliceParams->slice_data_size > buf->size) {
+            LOG("VP8 slice %u out of bounds (offset %u + size %u > buffer size %zu)",
+                i, sliceParams->slice_data_offset, sliceParams->slice_data_size, buf->size);
+            picParams->nBitstreamDataLen = 0;
+            ctx->bitstreamBuffer.size = 0;
+            ctx->sliceOffsets.size = 0;
+            return;
+        }
+
         uint32_t offset = (uint32_t) ctx->bitstreamBuffer.size;
         appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
-
-        appendBuffer(&ctx->bitstreamBuffer, chunk, chunkSize);
+        appendBuffer(&ctx->bitstreamBuffer, frameTag, headerSize);
         appendBuffer(&ctx->bitstreamBuffer, PTROFF(buf->ptr, sliceParams->slice_data_offset),
                      sliceParams->slice_data_size);
-        picParams->nBitstreamDataLen += chunkSize + sliceParams->slice_data_size;
+        picParams->nBitstreamDataLen += headerSize + sliceParams->slice_data_size;
     }
 }
 
