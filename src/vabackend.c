@@ -3693,7 +3693,7 @@ static bool resampleSameFormat(NVDriver *drv, BackingImage *srcImg, BackingImage
     return ok;
 }
 
-static bool copySurfaceBackingImage(NVDriver *drv, NVSurface *src, NVSurface *dst, const VAProcPipelineParameterBuffer *pipeline) {
+static bool blitSurfaceBackingImage(NVDriver *drv, NVSurface *src, NVSurface *dst, const VAProcPipelineParameterBuffer *pipeline) {
     if (src == NULL || dst == NULL || pipeline == NULL) {
         return false;
     }
@@ -3813,17 +3813,30 @@ static bool copySurfaceBackingImage(NVDriver *drv, NVSurface *src, NVSurface *ds
 
 done:
     pthread_mutex_lock(&dst->mutex);
-    dst->resolving = 0;
     dst->context = src->context;
     dst->progressiveFrame = src->progressiveFrame;
     dst->topFieldFirst = src->topFieldFirst;
     dst->secondField = src->secondField;
     dst->decodeFailed = src->decodeFailed;
     nvSurfaceCopyColorMetadata(dst, src);
-    pthread_cond_signal(&dst->cond);
     pthread_mutex_unlock(&dst->mutex);
 
+    // Clears both the surface and its backing-image resolving flags and wakes
+    // any waiter (vaSyncSurface / a later blit that reuses this surface).
+    setSurfaceResolving(dst, false);
+
     return true;
+}
+
+// The destination (render target) was marked resolving in nvBeginPicture.
+// Clear it on every failure path too, so a later vaSyncSurface doesn't block
+// forever on a blit we never performed.
+static bool copySurfaceBackingImage(NVDriver *drv, NVSurface *src, NVSurface *dst, const VAProcPipelineParameterBuffer *pipeline) {
+    if (blitSurfaceBackingImage(drv, src, dst, pipeline)) {
+        return true;
+    }
+    setSurfaceResolving(dst, false);
+    return false;
 }
 
 static VAStatus nvBeginPicture(
