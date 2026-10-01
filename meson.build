@@ -244,6 +244,15 @@ if not meson.is_cross_build()
         # to pass the real frame size, and each reference's real size, to
         # NVDEC; getting it wrong corrupts everything after a keyframe.
         # Generates its own fixture with SVT-AV1's forced-max-frame-height.
+        # Decoding into more than 32 distinct surfaces, which NVDEC can't
+        # address at once, so picture indices have to be reused (upstream
+        # #397). Compares a hardware decode against FFmpeg's software decoder;
+        # skips itself without libx264.
+        test('picture_index_reuse',
+             find_program('tests/test_picture_index_reuse.sh'),
+             timeout : 120,
+             env : test_env)
+
         test('av1_frame_size_override',
              find_program('tests/test_av1_frame_size_override.sh'),
              timeout : 120,

@@ -66,6 +66,7 @@ typedef struct
     cudaVideoChromaFormat   chromaFormat;
     int                     bitDepth;
     int                     pictureIdx;
+    uint64_t                pictureIdxLastUsed; // drv->pictureIdxUseCounter value when last decoded into or referenced
     VAContextID             contextId; // last context to use this target; remains valid as an ID after destruction
     /* The fork keeps a direct pointer as well: the encode paths and the
      * picture-index bookkeeping need the context itself, not just its ID.
@@ -217,6 +218,7 @@ typedef struct _NVDriver
     Array/*<Object>*/       objects;
     pthread_mutex_t         objectCreationMutex;
     VAGenericID             nextObjId;
+    uint64_t                pictureIdxUseCounter; // updated atomically
     bool                    useCorrectNV12Format;
     bool                    supports16BitSurface;
     bool                    supports444Surface;
@@ -345,16 +347,13 @@ typedef struct _NVContext
     cudaVideoSurfaceFormat decoderSurfaceFormat;
     cudaVideoChromaFormat decoderChromaFormat;
     int                 decoderBitDepth;
-    /* Bitmap of picture indices currently handed out to surfaces on this
-     * context. NVDEC addresses its decode surface array by this index, so it
-     * must be unique among *live* surfaces — but it can be reused once a
-     * surface is destroyed or moves to another context. surfaceCount is capped
-     * at 32, so one word covers every slot.
-     *
-     * This used to be a counter that only ever incremented, which meant a
-     * context could service at most surfaceCount distinct surfaces over its
-     * entire lifetime. See upstream issue #397. */
-    uint32_t            pictureIdxInUse;
+    /* NVDEC addresses at most 32 decode surfaces per decoder, but VA-API lets
+     * a client render into as many surfaces as it likes (Chromium/Electron
+     * and FFmpeg grow their pools past 32, upstream #397). pictureIdxOwners
+     * maps each index to the surface currently holding it, so an index can
+     * be handed back when its surface goes away, or reassigned from the
+     * least recently used surface when every index is held. */
+    NVSurface          *pictureIdxOwners[32]; // protected by drv->objectCreationMutex
     /* Whether any picture has been started on this context yet — the decoder
      * can only be reconfigured for a different surface format before that. */
     bool                decodeStarted;
