@@ -145,7 +145,6 @@ static void compactAV1BitstreamToCurrentFrame(NVContext *ctx, CUVIDPICPARAMS *pi
 
 static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *picParams) {
     static const int bit_depth_map[] = {0, 2, 4}; //8-bpc, 10-bpc, 12-bpc
-    static const uint8_t lr_type_map[] = {0, 1, 2, 3}; //VA-API and NVDEC use the same AV1 restoration type values
 
     VADecPictureParameterBufferAV1* buf = (VADecPictureParameterBufferAV1*) buffer->ptr;
     CUVIDAV1PICPARAMS *pps = &picParams->CodecSpecific.av1;
@@ -326,9 +325,9 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
     pps->delta_lf_res = buf->mode_control_fields.bits.log2_delta_lf_res;
     pps->delta_lf_multi = buf->mode_control_fields.bits.delta_lf_multi;
 
-    pps->lr_type[0] = lr_type_map[buf->loop_restoration_fields.bits.yframe_restoration_type];
-    pps->lr_type[1] = lr_type_map[buf->loop_restoration_fields.bits.cbframe_restoration_type];
-    pps->lr_type[2] = lr_type_map[buf->loop_restoration_fields.bits.crframe_restoration_type];
+    pps->lr_type[0] = buf->loop_restoration_fields.bits.yframe_restoration_type;
+    pps->lr_type[1] = buf->loop_restoration_fields.bits.cbframe_restoration_type;
+    pps->lr_type[2] = buf->loop_restoration_fields.bits.crframe_restoration_type;
     pps->lr_unit_size[0] = 1 + buf->loop_restoration_fields.bits.lr_unit_shift;
     pps->lr_unit_size[1] = 1 + buf->loop_restoration_fields.bits.lr_unit_shift - buf->loop_restoration_fields.bits.lr_uv_shift;
     pps->lr_unit_size[2] = pps->lr_unit_size[1];
@@ -358,6 +357,13 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
 
     if (pps->apply_grain) {
         NVSurface *display = nvSurfaceFromSurfaceId(ctx->drv, buf->current_display_picture);
+        // Film grain decodes the clean frame into the render target (kept as a
+        // reference) and writes the grain-applied frame to a separate display
+        // surface. That only works if the display surface is a distinct surface
+        // with a valid decoder picture index; otherwise redirecting would either
+        // pass CurrPicIdx=-1 (decode failure) or make the grained output alias
+        // the reference frame. In those cases decode normally into the render
+        // target instead.
         if (display != NULL && display != ctx->renderTarget && display->pictureIdx >= 0) {
             ctx->displayTarget = display;
             picParams->CurrPicIdx = display->pictureIdx;
@@ -531,6 +537,10 @@ static void setAV1SliceOffsets(NVContext *ctx, CUVIDPICPARAMS *picParams, const 
     }
 
     ensureAV1SliceOffsetStorage(ctx, numSlices);
+    // ensureAV1SliceOffsetStorage leaves buf == NULL (and size == 0) if the
+    // allocation failed under memory pressure. Bail before the loop below writes
+    // offsets[tileIndex * 2], which would dereference NULL and crash the whole
+    // GPU process on OOM.
     if (ctx->sliceOffsets.buf == NULL) {
         LOG("AV1 slice offset storage unavailable, skipping %u tile offsets", count);
         return;
