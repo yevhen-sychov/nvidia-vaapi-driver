@@ -22,6 +22,7 @@
 #include <va/va.h>
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>
+#include <drm_fourcc.h>
 #include <va/va_enc_h264.h>
 #include <va/va_enc_hevc.h>
 #include <va/va_enc_av1.h>
@@ -1758,17 +1759,17 @@ cleanup:
     vaDestroyConfig(dpy, config);
 }
 
-/* --- Test: automatic descriptor mode (NVD_DESCRIPTOR_MODE unset/auto) --- */
+/* --- Test: encode surface export layout --- */
 
-/* With NVD_DESCRIPTOR_MODE left unset (the default AUTO mode), surfaces that
- * belong to an encode context should be exported as a single combined-fourcc
- * layer (e.g. NV12 with 2 planes), since that's the layout Chrome's
- * WebGL/canvas "video-processing" worker path needs to render the local
- * capture/preview into before it's handed to NVENC. This must happen without
- * the user having to set NVD_DESCRIPTOR_MODE=combined manually. */
-static void test_encode_surface_export_auto_combined(void)
+/* Surfaces that belong to an encode context export with the same split
+ * per-plane layout as decode surfaces: one R8 and one RG88 layer for NV12,
+ * with every object carrying the same modifier (Chromium CHECKs that). This
+ * is what Chrome's capture path renders the local preview into before the
+ * frame reaches NVENC. They used to export as one combined NV12 layer
+ * instead; that layout has been dropped to match upstream. */
+static void test_encode_surface_export_split_layers(void)
 {
-    TEST_START("Encode surface export defaults to combined layer (auto mode)");
+    TEST_START("Encode surface exports split per-plane layers");
 
     VAConfigAttrib attrib = { .type = VAConfigAttribRTFormat,
                                .value = VA_RT_FORMAT_YUV420 };
@@ -1790,8 +1791,8 @@ static void test_encode_surface_export_auto_combined(void)
     TEST_ASSERT(st == VA_STATUS_SUCCESS, "coded_buf");
 
     /* vaBeginPicture() is what associates the surface with its (encode)
-     * context internally; the export decision relies on that association
-     * being in place, matching how Chrome always drives a real session. */
+     * context internally; export it in that state, matching how Chrome
+     * always drives a real session. */
     st = vaBeginPicture(dpy, context, surface);
     TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaBeginPicture");
 
@@ -1799,13 +1800,19 @@ static void test_encode_surface_export_auto_combined(void)
     st = vaExportSurfaceHandle(dpy, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
                                 VA_EXPORT_SURFACE_SEPARATE_LAYERS, &desc);
     TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaExportSurfaceHandle failed");
-    TEST_ASSERT(desc.num_objects == 1, "encode surface should export a single DMA-BUF object");
-    TEST_ASSERT(desc.num_layers == 1,
-                "encode surface should default to a single combined layer, not split per-plane");
+    bool uniform = true;
+    for (uint32_t i = 1; i < desc.num_objects; i++) {
+        uniform = uniform && desc.objects[i].drm_format_modifier == desc.objects[0].drm_format_modifier;
+    }
     for (int i = 0; i < desc.num_objects; i++) close(desc.objects[i].fd);
+    TEST_ASSERT(desc.num_layers == 2, "encode surface should export one layer per plane");
+    TEST_ASSERT(desc.layers[0].drm_format == DRM_FORMAT_R8 &&
+                desc.layers[1].drm_format == DRM_FORMAT_RG88,
+                "encode surface layers should be R8 + RG88");
+    TEST_ASSERT(uniform, "every exported object must carry the same modifier");
 
     /* Skip vaRenderPicture/vaEndPicture — this test only exercises the
-     * export-layout decision, not a full encode cycle (that's covered by
+     * export layout, not a full encode cycle (that's covered by
      * test_encode_one_frame() and friends elsewhere). */
     vaDestroyBuffer(dpy, coded_buf);
     vaDestroyContext(dpy, context);
@@ -2031,8 +2038,8 @@ int main(int argc, char **argv)
     test_bitrate_reconfigure_ramp_down_and_up();
     test_framerate_reconfigure_mid_session();
 
-    printf("\nDescriptor mode (auto):\n");
-    test_encode_surface_export_auto_combined();
+    printf("\nExport layout:\n");
+    test_encode_surface_export_split_layers();
 
     printf("\nRegression:\n");
     test_decode_still_works();

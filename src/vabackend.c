@@ -91,6 +91,7 @@ static FILE *LOG_OUTPUT;
 bool nvdLoggingEnabled = false;
 static FILE *STATS_OUTPUT;
 static bool LOG_DEBUG_ENABLED;
+static bool SINGLE_BUFFER_FORCED;
 
 // Destination for the statistics dump: the dedicated stats log if one was opened
 // (NVD_STATS_LOG), otherwise the regular log stream. Used by the stats subsystem.
@@ -124,17 +125,17 @@ static const uint32_t DEFAULT_MAX_DETACHED_BACKING_IMAGES = 16;
  * bucket than luma and the two planes carry genuinely different modifiers.
  * Measured against this driver the two converge at exactly luma height 172,
  * independent of width and identical for NV12 and P010 (see
- * tests/test_descriptor_mode.c).
+ * tests/test_export_layout.c).
  *
  * Below the threshold there is no VADRMPRIMESurfaceDescriptor we can emit that
  * is both correct and safe for real clients:
- *   - one object per plane (MULTI) reports the true modifiers, but Chromium
- *     does CHECK_EQ(objects[0].modifier, objects[i].modifier) in
+ *   - one object per plane (the default export) reports the true modifiers,
+ *     but Chromium does CHECK_EQ(objects[0].modifier, objects[i].modifier) in
  *     ExportVASurfaceAsNativePixmapDmaBufUnwrapped — a GPU-process abort, not
  *     a recoverable error;
- *   - a single object (SINGLE/COMBINED) has room for exactly one modifier, so
- *     the chroma plane gets described with luma's tiling and decodes to green
- *     macroblocks.
+ *   - a single object (NVD_SINGLE_BUFFER) has room for exactly one modifier,
+ *     so the chroma plane gets described with luma's tiling and decodes to
+ *     green macroblocks.
  *
  * So we advertise a floor at (rounded up to a GOB-friendly 176) and clients
  * transparently fall back to software for sub-QCIF content rather than getting
@@ -296,6 +297,9 @@ static void init() {
      * guard reject it before evaluating any arguments. */
     LOG_DEBUG_ENABLED = LOG_OUTPUT != NULL &&
                         nvdLogVerbose != NULL && strcmp(nvdLogVerbose, "0") != 0;
+    // Global toggle read once here (like every other NVD_* env) instead of via a
+    // getenv on each surface allocation in the direct backend.
+    SINGLE_BUFFER_FORCED = getenv("NVD_SINGLE_BUFFER") != NULL;
     char *nvdStats = getenv("NVD_STATS");
     if (nvdStats != NULL && strcmp(nvdStats, "0") != 0) {
         char *nvdStatsLog = getenv("NVD_STATS_LOG");
@@ -414,6 +418,10 @@ void logger(const char *filename, const char *function, int line, const char *ms
 
 bool nvdLogDebugEnabled(void) {
     return LOG_DEBUG_ENABLED;
+}
+
+bool nvdSingleBufferForced(void) {
+    return SINGLE_BUFFER_FORCED;
 }
 
 static uint64_t parseEnvU64(const char *name, uint64_t fallback) {
@@ -777,41 +785,6 @@ int pictureIdxFromSurfaceId(NVDriver *drv, VASurfaceID surfId) {
         return surf->pictureIdx;
     }
     return -1;
-}
-
-/* Used by the legacy self-preview heuristic in the DESCRIPTOR_MODE_AUTO
- * export path (direct_fillExportDescriptor()). Returns true if any active
- * OBJECT_TYPE_CONTEXT is an encode context whose resolution matches the
- * given width/height.
- *
- * Originally added to catch Chrome's decode-back self-preview thumbnail
- * (Chrome sometimes decodes its own outgoing encoded stream to render the
- * local preview, and that path needs the COMBINED export layout to avoid
- * EGL_BAD_MATCH in Chrome's WebGL importer). The original assumption was
- * "a remote peer's video is never encoded at the exact same dimensions as
- * your own outgoing capture" — which turned out to be false for real
- * WebRTC calls: peers negotiate to the local camera's rungs
- * (720p/540p/360p simulcast), so almost every remote decoded surface
- * matches a live local encode context and used to false-trigger this
- * heuristic, producing green macroblock corruption on peers.
- *
- * The heuristic is now gated behind NVD_SELF_PREVIEW_COMBINED=1
- * (NVDriver.selfPreviewCombinedOptIn); this function is only called when
- * that opt-in is active. */
-bool nvHasActiveEncodeContextWithResolution(NVDriver *drv, uint32_t width, uint32_t height) {
-    bool found = false;
-    pthread_mutex_lock(&drv->objectCreationMutex);
-    ARRAY_FOR_EACH(Object, o, &drv->objects)
-        if (o->type == OBJECT_TYPE_CONTEXT) {
-            NVContext *ctx = (NVContext*) o->obj;
-            if (ctx != NULL && ctx->isEncode && ctx->width == width && ctx->height == height) {
-                found = true;
-                break;
-            }
-        }
-    END_FOR_EACH
-    pthread_mutex_unlock(&drv->objectCreationMutex);
-    return found;
 }
 
 static void setSurfaceResolving(NVSurface *surface, bool resolving);
@@ -5493,44 +5466,6 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
                                        : DEFAULT_MAX_DETACHED_BACKING_IMAGE_BYTES);
     drv->maxDetachedBackingImages =
         (uint32_t) parseEnvU64("NVD_MAX_DETACHED_BACKING_IMAGES", DEFAULT_MAX_DETACHED_BACKING_IMAGES);
-
-    /* Default (unset or "auto") lets the driver pick the per-surface layout
-     * on its own using the deterministic isEncode flag: encode-context
-     * surfaces (local capture/preview, Chrome's WebGL importer path) get
-     * COMBINED; decode-context surfaces (remote peer / video playback,
-     * Chrome's normal decode-display importer path) get SINGLE. See
-     * DESCRIPTOR_MODE_AUTO and direct_fillExportDescriptor().
-     * Explicitly setting single/multi/combined forces that layout for every
-     * surface, overriding the automatic per-surface decision.
-     * Set NVD_SELF_PREVIEW_COMBINED=1 to re-enable the legacy
-     * resolution-match self-preview heuristic (rarely wanted; see notes on
-     * NVDriver.selfPreviewCombinedOptIn). */
-    const char *modeEnv = getenv("NVD_DESCRIPTOR_MODE");
-    if (modeEnv != NULL && strcmp(modeEnv, "single") == 0) {
-        drv->descriptorMode = DESCRIPTOR_MODE_SINGLE;
-    } else if (modeEnv != NULL && strcmp(modeEnv, "multi") == 0) {
-        drv->descriptorMode = DESCRIPTOR_MODE_MULTI;
-    } else if (modeEnv != NULL && strcmp(modeEnv, "combined") == 0) {
-        drv->descriptorMode = DESCRIPTOR_MODE_COMBINED;
-    } else if (modeEnv != NULL && strcmp(modeEnv, "auto") != 0) {
-        LOG("Ignoring invalid NVD_DESCRIPTOR_MODE=%s", modeEnv);
-        drv->descriptorMode = DESCRIPTOR_MODE_AUTO;
-    } else {
-        drv->descriptorMode = DESCRIPTOR_MODE_AUTO;
-    }
-    LOG("Descriptor mode: %s", drv->descriptorMode == DESCRIPTOR_MODE_SINGLE ? "single" :
-        drv->descriptorMode == DESCRIPTOR_MODE_COMBINED ? "combined" :
-        drv->descriptorMode == DESCRIPTOR_MODE_AUTO ? "auto" : "multi")
-
-    /* Legacy self-preview heuristic opt-in. See NVDriver.selfPreviewCombinedOptIn
-     * and direct_fillExportDescriptor() for why this is off by default. */
-    const char *selfPreviewEnv = getenv("NVD_SELF_PREVIEW_COMBINED");
-    drv->selfPreviewCombinedOptIn = selfPreviewEnv != NULL &&
-                                     strcmp(selfPreviewEnv, "1") == 0;
-    if (drv->selfPreviewCombinedOptIn) {
-        LOG("NVD_SELF_PREVIEW_COMBINED=1: AUTO decode surfaces matching an "
-            "active encode context resolution will be exported as COMBINED");
-    }
 
     nvStatsInit(drv);
 

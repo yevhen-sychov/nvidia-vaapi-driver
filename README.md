@@ -406,15 +406,15 @@ keyframes explicitly).
   height **172**, independent of width and identical for NV12 and P010.
   Below that there is no `VADRMPRIMESurfaceDescriptor` that is both
   correct and safe: a descriptor object carries exactly one modifier, so
-  a single-object export (SINGLE/COMBINED) describes chroma with luma's
-  tiling and renders green macroblocks, while a one-object-per-plane
-  export (MULTI) reports the true modifiers and trips Chromium's
+  a single-object export (`NVD_SINGLE_BUFFER=1`) describes chroma with
+  luma's tiling and renders green macroblocks, while the default
+  one-object-per-plane export reports the true modifiers and trips Chromium's
   `CHECK_EQ(objects[0].modifier, objects[i].modifier)` in
   `ExportVASurfaceAsNativePixmapDmaBufUnwrapped` — a GPU-process abort,
   not a recoverable error. Advertising the floor makes clients
   transparently use software for sub-QCIF content instead. Pinned by
-  `tests/test_descriptor_mode.c` (both the AUTO and `descriptor_mode_multi`
-  runs). This matches the mitigation in upstream issue #440.
+  `tests/test_export_layout.c` (both the default and
+  `export_layout_single_buffer` runs). This matches the mitigation in upstream issue #440.
 
 ## Video post-processing (`VAEntrypointVideoProc`)
 
@@ -662,7 +662,7 @@ Note also that Firefox has **no VA-API encode path at all** — see
 
 ## Chrome
 
-This fork includes the Chromium-compatible single-buffer export path. For Chrome / Chromium based browsers, set `LIBVA_DRIVER_NAME=nvidia` and start the browser with flags similar to:
+For Chrome / Chromium based browsers, set `LIBVA_DRIVER_NAME=nvidia` and start the browser with flags similar to:
 
 ```sh
 LIBVA_DRIVER_NAME=nvidia google-chrome \
@@ -767,72 +767,30 @@ What Chrome's WebRTC *does* need from the encoder is narrower than it looks:
 > and drop *all* hardware video (decode included) to software. Rebuild/reinstall
 > the driver (e.g. `update-nvenc.sh`) and restart the browser.
 
-### `NVD_DESCRIPTOR_MODE` (auto by default)
+### DMA-BUF export layout
 
-By default (`NVD_DESCRIPTOR_MODE` unset, or explicitly `auto`) the driver picks
-the DMA-BUF export layout **per surface**, automatically, based on whether the
-surface belongs to an encode context or a decode context:
+Multi-plane YUV surfaces (NV12, P010, ...) are exported the same way upstream
+exports them: one split single-channel layer per plane (`R8` + `RG88` for
+NV12), each plane in its own DMA-BUF object at offset 0, with every object
+carrying the same modifier. Set `NVD_SINGLE_BUFFER=1` to pack all planes into
+one shared object instead (chroma at an offset), the older layout. Per-plane
+importers such as mpv, GStreamer and FFmpeg mis-detile chroma in that layout,
+so keep it for comparison only.
 
-- Encode-context surfaces (local screen/camera capture that Chrome's compositor
-  renders *into* via its WebGL/canvas "video-processing" worker path before
-  it's handed to NVENC) are exported as a single combined-fourcc layer (e.g.
-  NV12 with 2 planes).
-- Decode-context surfaces (the normal remote/received-video display path) are
-  exported as one split single-channel layer per plane (`R8`/`GR88`), which is
-  what Chromium's decode-display zero-copy importer expects.
+The layout no longer depends on whether a surface belongs to an encode or a
+decode context. This fork used to export encode-context surfaces as a single
+combined-fourcc layer (`NVD_DESCRIPTOR_MODE`, `NVD_SELF_PREVIEW_COMBINED`);
+both variables are gone and are ignored if set.
 
-That's the whole rule: it uses the deterministic `isEncode` flag on the
-surface's VA-API context and nothing else. No resolution guessing, no
-inference from other live contexts.
-
-This matters because Chrome's two consumers of an exported DMA-BUF want
-different layouts on the same GPU/driver/ANGLE combination:
-
-> **EGL_BAD_MATCH / "requested LINUX_DRM_FORMAT is not supported":** if Chrome's
-> log is full of `eglCreateImageKHR: EGL_BAD_MATCH` errors together with
+> **If the local camera/screen preview breaks in Chrome:** the combined layout
+> existed because Chrome's WebGL/canvas "video-processing" worker, which renders
+> the local capture into an encode surface, was seen rejecting the split layout
+> on NVIDIA with `eglCreateImageKHR: EGL_BAD_MATCH`, followed by
 > `OzoneImageBacking::ProduceSkiaGanesh failed to create GL representation` and
-> `CopySharedImage: unknown mailbox` (typically from a `RendererBlinkWorker`
-> raster/WebGL/canvas import, not the normal video display path), that's ANGLE's
-> NVIDIA DMA-BUF importer on that worker path rejecting the split per-plane
-> layout and only accepting the *combined* fourcc. The `auto` default handles
-> this for you on encode-context surfaces.
-
-If you need to force one layout for *every* surface (e.g. to test the
-traditional per-plane behavior, or because the automatic per-surface decision
-doesn't cover your specific workflow — see the caveat below), set
-`NVD_DESCRIPTOR_MODE` explicitly to `single` (split layer, single DMA-BUF
-object), `multi` (split layer, one DMA-BUF object per plane), or `combined`
-(single combined-fourcc layer, for every surface regardless of encode/decode).
-Check `NVD_LOG=1` for the `Descriptor mode: ...` line to confirm which mode is
-active.
-
-> **Known caveat:** encode-vs-decode is the only signal we have. There's no
-> VA-API flag that says "this decode is a local self-preview," so a workflow
-> that relies on Chrome's decode-back self-preview path (Chrome decoding its
-> own just-encoded stream back to render the local thumbnail) will import
-> that surface as SINGLE and hit `EGL_BAD_MATCH` in the WebGL/canvas worker.
-> If that describes your setup, either force `NVD_DESCRIPTOR_MODE=combined`
-> globally (at the cost of remote decode display), or set
-> `NVD_SELF_PREVIEW_COMBINED=1` (see below).
-
-#### `NVD_SELF_PREVIEW_COMBINED=1` (opt-in escape hatch)
-
-Previously the AUTO default *also* forced COMBINED on any decode surface
-whose resolution matched a currently-active local encode context, on the
-theory that this was always Chrome's decode-back self-preview thumbnail.
-That assumption turned out to be wrong for real WebRTC meetings: video
-platforms (Meet, Zoom, Slack, corporate tools) negotiate every peer to
-common resolutions (720p / 540p / 360p simulcast rungs) — so every remote
-peer whose incoming stream happens to be at your camera's resolution was
-mis-classified as a self-preview and rendered with **green macroblock
-corruption** in Chrome's normal decode-display importer.
-
-The resolution-match heuristic is therefore off by default. Set
-`NVD_SELF_PREVIEW_COMBINED=1` to re-enable it if you rely specifically on
-Chrome's decode-back self-preview path (rare — most WebRTC apps render the
-local thumbnail directly from `getUserMedia` without touching the encoder).
-When set, an `NVD_LOG=1` line at driver init confirms it's active. Leave
-unset (the default) for any normal video-conferencing setup.
+> `CopySharedImage: unknown mailbox`, usually from a `RendererBlinkWorker`.
+> That was observed with the single-buffer layout; whether it still happens
+> with one object per plane is untested. If you see it, please report it with
+> the Chrome log and `NVD_LOG=1` output.
 
 ### Encoder restart delay after stopping/switching screenshare
 
@@ -948,9 +906,9 @@ Individual harnesses:
 
 | Binary / script | What it covers |
 |---|---|
-| `test_decode` | AV1 (8-bit + 10-bit) decode init, combined-RTFormat resolution, DMA-BUF export, auto descriptor mode (asserts decode surfaces stay SPLIT even when a same-res encode context is live — the WebRTC-peer green-macroblock regression guard). |
-| `test_descriptor_mode` | Standalone regression for the AUTO descriptor-mode contract: decode-only surface → SPLIT; decode + concurrent encode @ same res → SPLIT (no green macroblocks on peers); with `NVD_SELF_PREVIEW_COMBINED=1` → same case flips to COMBINED (opt-in fallback). |
-| `test_encode` | Encode entrypoints, config attributes, single-frame encode for H.264 / HEVC / HEVC Main10 / AV1 / AV1 Main10, rate control + quality-level params, AV1 temporal SVC and combined-RTFormat encode, dynamic resolution, sequential encodes, coded-buffer reuse, long-running single session, live bitrate/framerate reconfigure, auto-combined encode export, decode-still-works co-existence, dimension-mismatch, H.264 B-frames. |
+| `test_decode` | AV1 (8-bit + 10-bit) decode init, combined-RTFormat resolution, DMA-BUF export (asserts decode surfaces stay split even when a same-res encode context is live — the WebRTC-peer green-macroblock regression guard). |
+| `test_export_layout` | DMA-BUF export layout: decode-only surface → split layers; decode + concurrent encode @ same res → still split (no green macroblocks on peers); advertised MinHeight and uniform modifiers across objects (Chromium's CHECK). Re-run with `NVD_SINGLE_BUFFER=1` as `export_layout_single_buffer`. |
+| `test_encode` | Encode entrypoints, config attributes, single-frame encode for H.264 / HEVC / HEVC Main10 / AV1 / AV1 Main10, rate control + quality-level params, AV1 temporal SVC and combined-RTFormat encode, dynamic resolution, sequential encodes, coded-buffer reuse, long-running single session, live bitrate/framerate reconfigure, encode surface export layout, decode-still-works co-existence, dimension-mismatch, H.264 B-frames. |
 | `test_encode_config` | Config-side coverage: entrypoints, RTFormat, rate control, packed headers, ref frames, max dimensions, quality range, surface allocation (NV12 / P010 / small / 4K), export descriptor. |
 | `tests/test_encode_only.sh` | The CUDA-less [encode-only path](#encode-only-mode-no-cuda-in-process), forced with `CUDA_VISIBLE_DEVICES=""`. Runs twice: with no helper reachable (the driver must still advertise its built-in encode profiles — answering "no encode entrypoints" here is what drops clients to software x264), and against a helper it starts in a private `XDG_RUNTIME_DIR` (capabilities arrive over IPC, and a real H.264 + HEVC frame is encoded through it via `vaDeriveImage` + host memcpy, the way a client with no CUDA has to fill a surface). Every other test in the suite runs with a working CUDA context, so nothing else notices when this mode regresses. |
 | `test_ipc_fuzz` | Fuzz surface for the NVENC out-of-process IPC helper (invalid commands, truncated inits, oversized payloads, rapid connect/disconnect, double-init, encode-without-init). |
@@ -1138,17 +1096,12 @@ efortin PR #427 base and elFarto's upstream master. See
   + `/usr/libexec/nvenc-helper` binary + IPC channel for sandboxed browser
   processes that can't init CUDA/NVENC directly. Rebuild + restart with
   `update-nvenc.sh`.
-- **Chrome-compatible DMA-BUF descriptor mode** — `NVD_DESCRIPTOR_MODE` env
-  var (default `auto`), picks per-surface layout for encode-context vs.
-  decode-context surfaces using the deterministic `isEncode` flag on the
-  VA-API context. **AUTO no longer uses the resolution-matching self-preview
-  heuristic** (was disproven by real WebRTC calls: peers negotiate to the
-  local camera's resolution and the heuristic false-triggered on every
-  remote peer, producing green macroblock corruption in Chrome's normal
-  decode-display importer). The legacy behavior is available behind
-  `NVD_SELF_PREVIEW_COMBINED=1` for anyone who specifically depends on
-  Chrome's decode-back self-preview path. Regression pinned by
-  `tests/test_descriptor_mode.c`.
+- **DMA-BUF export realigned with upstream** — the fork's
+  `NVD_DESCRIPTOR_MODE` / `NVD_SELF_PREVIEW_COMBINED` export modes are gone;
+  YUV surfaces export one DMA-BUF object per plane like upstream, with
+  `NVD_SINGLE_BUFFER=1` for the shared-buffer layout. The fork keeps only its
+  CUDA-less allocation path for encode-only clients, the P012-as-P016 export
+  and the 176px height floor. See [DMA-BUF export layout](#dma-buf-export-layout).
 - **Live rate-control / framerate reconfigure** — mid-session
   `VAEncMiscParameterTypeRateControl` /
   `VAEncMiscParameterTypeFrameRate` are applied through
@@ -1177,9 +1130,7 @@ efortin PR #427 base and elFarto's upstream master. See
   picked upstream's split back in: `NVStatCounter` enum, `nvStatsInit`,
   `nvStatsIncrement`, `nvStatsLog` now live in `src/stats.c`; the tiny
   `nv_gettid` / `nvStatsOutput` helpers stay in `vabackend.c` as
-  non-static and are re-exported through `vabackend.h`. Kept the
-  fork's `NVD_DESCRIPTOR_MODE` parsing block right next to the new
-  `nvStatsInit(drv)` call. Same rationale as the encode-dispatch split
+  non-static and are re-exported through `vabackend.h`. Same rationale as the encode-dispatch split
   above: reduce the delta this fork carries in `vabackend.c` so
   upstream merges stop churning it.
 - **Encode-dispatch split into `src/nvenc_dispatch.c`** — the

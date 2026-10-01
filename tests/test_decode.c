@@ -188,76 +188,16 @@ static void test_av1_decode_export(void)
     TEST_PASS();
 }
 
-/* NVD_DESCRIPTOR_MODE=combined should export YUV surfaces as a single layer
- * carrying the combined DRM fourcc (e.g. NV12) with multiple planes, instead
- * of one split single-channel layer per plane (R8 + GR88). This is the
- * workaround for EGL/ANGLE DMA-BUF importers that reject the split layout
- * with EGL_BAD_MATCH. The mode is read once per driver instance, so this
- * test uses its own display separate from the shared `dpy` used above. */
-static void test_av1_decode_combined_descriptor_mode(void)
-{
-    TEST_START("AV1 decode export with NVD_DESCRIPTOR_MODE=combined");
-
-    setenv("NVD_DESCRIPTOR_MODE", "combined", 1);
-    int local_drm_fd = open(DRM_DEVICE, O_RDWR);
-    TEST_ASSERT(local_drm_fd >= 0, "Cannot open DRM device");
-    VADisplay local_dpy = vaGetDisplayDRM(local_drm_fd);
-    TEST_ASSERT(local_dpy != NULL, "vaGetDisplayDRM failed");
-    int major, minor;
-    VAStatus st = vaInitialize(local_dpy, &major, &minor);
-    unsetenv("NVD_DESCRIPTOR_MODE");
-    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaInitialize failed");
-
-    VAConfigID config_id;
-    VAConfigAttrib rt_attr = { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 };
-    st = vaCreateConfig(local_dpy, VAProfileAV1Profile0, VAEntrypointVLD, &rt_attr, 1, &config_id);
-    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateConfig failed");
-
-    VASurfaceID surfaces[1];
-    st = vaCreateSurfaces(local_dpy, VA_RT_FORMAT_YUV420, 1920, 1080, surfaces, 1, NULL, 0);
-    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateSurfaces failed");
-
-    VAContextID context_id;
-    st = vaCreateContext(local_dpy, config_id, 1920, 1080, VA_PROGRESSIVE, surfaces, 1, &context_id);
-    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateContext failed");
-
-    VADRMPRIMESurfaceDescriptor desc;
-    st = vaExportSurfaceHandle(local_dpy, surfaces[0], VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                               VA_EXPORT_SURFACE_SEPARATE_LAYERS, &desc);
-    TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaExportSurfaceHandle failed");
-
-    TEST_ASSERT(desc.num_objects == 1, "combined mode should export a single DMA-BUF object");
-    TEST_ASSERT(desc.num_layers == 1, "combined mode should export a single combined layer");
-    TEST_ASSERT(desc.layers[0].drm_format == DRM_FORMAT_NV12,
-                "combined layer should carry the combined NV12 fourcc, not a split plane format");
-    TEST_ASSERT(desc.layers[0].num_planes == 2, "combined NV12 layer should carry both planes");
-
-    for (int i = 0; i < desc.num_objects; i++) close(desc.objects[i].fd);
-
-    vaDestroySurfaces(local_dpy, surfaces, 1);
-    vaDestroyContext(local_dpy, context_id);
-    vaDestroyConfig(local_dpy, config_id);
-    vaTerminate(local_dpy);
-    close(local_drm_fd);
-    TEST_PASS();
-}
-
-/* AUTO mode (the default) picks the export layout per-surface using the
- * deterministic isEncode flag on the surface's context:
- *   - encode context (local capture/preview) → COMBINED layer
- *   - decode context (remote peer, video playback)      → SPLIT layers
- * The legacy resolution-match self-preview heuristic (which used to also
- * force COMBINED on a decode surface whose size happened to match an
- * active encode context, on the theory that it was Chrome's decode-back
- * self-preview thumbnail) is off by default in AUTO — it false-triggered
- * on every real WebRTC call because peers negotiate to the local camera's
- * resolution, and mis-classifying those peers as self-previews produced
- * green macroblock corruption in Chrome's normal decode-display importer.
- * It's still available behind NVD_SELF_PREVIEW_COMBINED=1 for the rare
- * users who need Chrome's decode-back self-preview path. */
+/* A decode surface exports as split per-plane layers, even while an encode
+ * context of the same size is live. An old heuristic exported such surfaces
+ * as one combined layer, on the theory that they were Chrome's decode-back
+ * self-preview thumbnail; it false-triggered on every real WebRTC call,
+ * because peers negotiate to the local camera's resolution, and Chrome's
+ * normal decode-display importer rendered those peers with green macroblock
+ * corruption. */
 static void test_decode_auto_mode_split_for_all_decodes(void)
 {
-    TEST_START("AUTO mode: decode surface stays SPLIT even with matching encode context");
+    TEST_START("Decode surface stays split even with matching encode context");
 
     VAConfigAttrib enc_attr = { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 };
     VAConfigID enc_config;
@@ -285,9 +225,9 @@ static void test_decode_auto_mode_split_for_all_decodes(void)
     TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateConfig (decode) failed");
 
     /* Decode surface at the SAME resolution as the live encode context above
-     * — used to be classified as "self-preview" and forced to COMBINED, but
-     * that's exactly the case that made remote WebRTC peers render as green
-     * macroblocks. AUTO must return SPLIT (num_layers == 2) here. */
+     * — used to be classified as "self-preview" and exported as one combined
+     * layer, but that's exactly the case that made remote WebRTC peers render
+     * as green macroblocks. Must stay split (num_layers == 2) here. */
     VASurfaceID matching_decode_surface;
     st = vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, 640, 480, &matching_decode_surface, 1, NULL, 0);
     TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaCreateSurfaces (matching decode) failed");
@@ -301,7 +241,7 @@ static void test_decode_auto_mode_split_for_all_decodes(void)
                                VA_EXPORT_SURFACE_SEPARATE_LAYERS, &desc);
     TEST_ASSERT(st == VA_STATUS_SUCCESS, "vaExportSurfaceHandle (matching) failed");
     TEST_ASSERT(desc.num_layers == 2,
-                "AUTO must NOT force COMBINED on a decode surface just because "
+                "a decode surface must not become one combined layer just because "
                 "it matches an encode resolution — that's the WebRTC-peer "
                 "green-macroblock regression");
     for (int i = 0; i < desc.num_objects; i++) close(desc.objects[i].fd);
@@ -465,7 +405,6 @@ int main()
     test_av1_decode_init_10bit();
     test_av1_decode_combined_rtformat();
     test_av1_decode_export();
-    test_av1_decode_combined_descriptor_mode();
     test_decode_auto_mode_split_for_all_decodes();
     test_picture_index_is_recycled();
     test_surface_outlives_its_context();

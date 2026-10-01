@@ -68,7 +68,7 @@ typedef struct
     int                     pictureIdx;
     VAContextID             contextId; // last context to use this target; remains valid as an ID after destruction
     /* The fork keeps a direct pointer as well: the encode paths and the
-     * descriptor-mode heuristics need the context itself, not just its ID.
+     * picture-index bookkeeping need the context itself, not just its ID.
      * nvDestroyContext() clears it on every surface it owned, so "context is
      * gone" is representable as NULL rather than a dangling pointer. */
     struct _NVContext       *context;
@@ -239,17 +239,6 @@ typedef struct _NVDriver
     VAProfile               profiles[MAX_PROFILES];
     bool                    nvencAvailable;
     bool                    cudaAvailable;  /* false when 32-bit CUDA fails */
-    DescriptorMode          descriptorMode;
-    /* Opt-in (NVD_SELF_PREVIEW_COMBINED=1): re-enable the legacy AUTO
-     * resolution-match heuristic that treats a decode surface at the same
-     * resolution as an active encode context as a "self-preview" and gives
-     * it the COMBINED layout. Off by default because real WebRTC calls
-     * negotiate peers to the same resolution as the local camera and the
-     * heuristic then false-triggered on every remote peer, showing green
-     * macroblock corruption in Chrome's normal decode-display importer.
-     * Only enable this if you specifically rely on Chrome's decode-back
-     * self-preview path (rare). */
-    bool                    selfPreviewCombinedOptIn;
     /*
      * NVENC capability probe results. Populated once, lazily, on the first
      * encode-config query. Used to gate profile advertisement so we don't
@@ -440,7 +429,6 @@ extern const NVFormatInfo formatsInfo[];
 void appendBuffer(AppendableBuffer *ab, const void *buf, uint64_t size);
 int pictureIdxFromSurfaceId(NVDriver *ctx, VASurfaceID surf);
 NVSurface* nvSurfaceFromSurfaceId(NVDriver *drv, VASurfaceID surf);
-bool nvHasActiveEncodeContextWithResolution(NVDriver *drv, uint32_t width, uint32_t height);
 
 uint32_t nvExportableFourcc(uint32_t fourcc);
 // Cross-TU lookup / allocation helpers used by the moved encode dispatch code
@@ -458,6 +446,7 @@ void nvBackingImageCopyColorMetadata(BackingImage *dst, const BackingImage *src)
 bool checkCudaErrors(CUresult err, const char *file, const char *function, const int line);
 void logger(const char *filename, const char *function, int line, const char *msg, ...);
 bool nvdLogDebugEnabled(void);
+bool nvdSingleBufferForced(void);
 
 /* True when NVD_LOG selected a destination. Exposed as a plain global rather
  * than an accessor so LOG_ENABLED() compiles to a single load and can be used

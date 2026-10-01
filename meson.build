@@ -159,10 +159,10 @@ if not meson.is_cross_build()
         dependencies : libva_test_deps, install : false)
     test('decode', test_decode, timeout : 60, env : test_env)
 
-    test_descriptor_mode = executable('test_descriptor_mode',
-        'tests/test_descriptor_mode.c',
+    test_export_layout = executable('test_export_layout',
+        'tests/test_export_layout.c',
         dependencies : libva_test_deps, install : false)
-    test('descriptor_mode', test_descriptor_mode, timeout : 60, env : test_env)
+    test('export_layout', test_export_layout, timeout : 60, env : test_env)
 
     # Low-level VA-API contracts that Chromium/Firefox/FFmpeg depend on --
     # easy to break while refactoring, and they fail downstream in confusing
@@ -186,31 +186,19 @@ if not meson.is_cross_build()
         install : false)
     test('concurrent_sessions', test_concurrent, timeout : 120, env : test_env)
 
-    # Opt-in coverage: re-runs descriptor_mode with the escape hatch active
-    # to pin the fallback behavior we promise in the README.
-    test_env_selfpreview = environment({
+    # YUV surfaces export one dma-buf object per plane by default;
+    # NVD_SINGLE_BUFFER=1 packs every plane into one shared object instead.
+    # Re-run the layout suite there to keep Chromium's uniform-modifier CHECK
+    # covered on that path too.
+    test_env_single_buffer = environment({
         'NVD_LOG': '1',
         'LIBVA_DRIVER_NAME': 'nvidia',
         'LIBVA_DRIVERS_PATH': meson.project_build_root(),
         'LD_LIBRARY_PATH': meson.project_build_root(),
-        'NVD_SELF_PREVIEW_COMBINED': '1',
+        'NVD_SINGLE_BUFFER': '1',
     })
-    test('descriptor_mode_self_preview_optin', test_descriptor_mode,
-         timeout : 60, env : test_env_selfpreview)
-
-    # MULTI is the only layout that exports one DMA-BUF object per plane, so
-    # it is the only one that can surface a per-plane block-linear modifier
-    # split to the client. Re-run the suite there to keep Chromium's
-    # uniform-modifier CHECK covered on that path.
-    test_env_multi = environment({
-        'NVD_LOG': '1',
-        'LIBVA_DRIVER_NAME': 'nvidia',
-        'LIBVA_DRIVERS_PATH': meson.project_build_root(),
-        'LD_LIBRARY_PATH': meson.project_build_root(),
-        'NVD_DESCRIPTOR_MODE': 'multi',
-    })
-    test('descriptor_mode_multi', test_descriptor_mode,
-         timeout : 60, env : test_env_multi)
+    test('export_layout_single_buffer', test_export_layout,
+         timeout : 60, env : test_env_single_buffer)
 
     gst_launch = find_program('gst-launch-1.0', required : false)
     if gst_launch.found()

@@ -33,6 +33,30 @@ static bool isRgbSurfaceFourcc(uint32_t fourcc) {
            fourcc == VA_FOURCC_BGRX;
 }
 
+static NVFormat nvFormatForSurface(const NVSurface *surface) {
+    if (isRgbSurfaceFourcc((uint32_t) surface->fourcc)) {
+        return NV_FORMAT_ARGB;
+    }
+
+    switch (surface->format) {
+    case cudaVideoSurfaceFormat_P016:
+        switch (surface->bitDepth) {
+        case 10:
+            return NV_FORMAT_P010;
+        case 12:
+            return NV_FORMAT_P012;
+        default:
+            return NV_FORMAT_P016;
+        }
+    case cudaVideoSurfaceFormat_YUV444_16Bit:
+        return NV_FORMAT_Q416;
+    case cudaVideoSurfaceFormat_YUV444:
+        return NV_FORMAT_444P;
+    default:
+        return NV_FORMAT_NV12;
+    }
+}
+
 static void findGPUIndexFromFd(NVDriver *drv) {
     //find the CUDA device id
     uint8_t drmUuid[16];
@@ -627,6 +651,109 @@ static void pruneDetachedBackingImagesToLimits(NVDriver *drv) {
     pthread_mutex_unlock(&drv->imagesMutex);
 }
 
+// Allocate a multi-plane YUV backing image as one dma-buf object per plane, all sharing a
+// single (max-across-planes) block-linear modifier. This satisfies Chromium's requirement
+// that every plane report the same DRM modifier while keeping each plane at offset 0 of its
+// own object, so per-plane importers (mpv/GStreamer/ffmpeg) detile the chroma plane
+// correctly -- unlike the single-buffer layout, where chroma sits at a non-zero offset
+// inside a shared tiled buffer and those importers mis-detile it.
+static BackingImage *direct_allocateBackingImage_perPlane(NVDriver *drv, NVSurface *surface) {
+    NVDriverImage driverImages[3] = { 0 };
+    BackingImage *backingImage = calloc(1, sizeof(BackingImage));
+    if (backingImage == NULL) {
+        return NULL;
+    }
+    initBackingImageSync(backingImage);
+
+    // Separate object per plane -> the multi-object export/destroy paths handle it.
+    backingImage->isSingleBuffer = false;
+    for (int i = 0; i < 4; i++) {
+        backingImage->fds[i] = -1;
+    }
+
+    backingImage->format = nvFormatForSurface(surface);
+    const NVFormatInfo *fmtInfo = &formatsInfo[backingImage->format];
+
+    // Reuse the layout purely to obtain each plane's block height and pitch/aligned
+    // size; the packed offsets it returns are ignored (each plane is offset 0 in its
+    // own buffer). Pass unifyBlockHeight=false: each plane is its own dma-buf object
+    // with its own modifier, so it keeps its natural per-plane block height and
+    // matches what the decoder produced (see calculate_unified_image_layout).
+    calculate_unified_image_layout(&drv->driverContext, driverImages, surface->width, surface->height,
+                                   fmtInfo->bppc, fmtInfo->numPlanes, fmtInfo->plane, false);
+    LOG_DEBUG("Allocating per-plane BackingImage: %p %ux%u", backingImage, surface->width, surface->height);
+
+    for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+        int memFd = -1, memFd2 = -1, drmFd = -1;
+        if (!alloc_buffer(&drv->driverContext, driverImages[i].memorySize, &driverImages[i], &memFd, &memFd2, &drmFd)) {
+            goto fail;
+        }
+
+        const CUDA_EXTERNAL_MEMORY_HANDLE_DESC extMemDesc = {
+            .type      = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
+            .handle.fd = memFd,
+            .flags     = 0,
+            .size      = driverImages[i].memorySize
+        };
+        if (CHECK_CUDA_RESULT(drv->cu->cuImportExternalMemory(&backingImage->cudaImages[i].extMem, &extMemDesc))) {
+            close(memFd);
+            close(memFd2);
+            close(drmFd);
+            goto fail;
+        }
+        // memFd is now owned by CUDA; memFd2 must be closed here (see import_to_cuda).
+        close(memFd2);
+        backingImage->fds[i] = drmFd;
+        cacheBackingImageFdStat(backingImage, (int) i);
+
+        // Create the array at the plane's natural height. Each plane is its own object
+        // carrying its own modifier, and calculate_unified_image_layout (called with
+        // unifyBlockHeight=false) already advertised each plane's per-plane block height.
+        // Handing CUDA the natural height makes it derive that same per-plane block, so
+        // the array tiling matches the modifier. (Rounding up to the shared max block --
+        // as the single-buffer path must -- would instead make CUDA pick the larger block
+        // and disagree with the per-plane modifier -> the importer detiles wrong -> green
+        // chroma, e.g. NV12 chroma at a 256x144 coded height.)
+        CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC mipmapArrayDesc = {
+            .arrayDesc = {
+                .Width = driverImages[i].width,
+                .Height = driverImages[i].height,
+                .Depth = 0,
+                .Format = fmtInfo->bppc == 1 ? CU_AD_FORMAT_UNSIGNED_INT8 : CU_AD_FORMAT_UNSIGNED_INT16,
+                .NumChannels = fmtInfo->plane[i].channelCount,
+                .Flags = 0
+            },
+            .numLevels = 1,
+            .offset = 0
+        };
+        if (CHECK_CUDA_RESULT(drv->cu->cuExternalMemoryGetMappedMipmappedArray(&backingImage->cudaImages[i].mipmapArray, backingImage->cudaImages[i].extMem, &mipmapArrayDesc))) {
+            goto fail;
+        }
+        if (CHECK_CUDA_RESULT(drv->cu->cuMipmappedArrayGetLevel(&backingImage->arrays[i], backingImage->cudaImages[i].mipmapArray, 0))) {
+            goto fail;
+        }
+
+        backingImage->strides[i] = driverImages[i].pitch;
+        backingImage->mods[i] = driverImages[i].mods;
+        backingImage->offsets[i] = 0;
+        backingImage->size[i] = driverImages[i].memorySize;
+    }
+
+    backingImage->width = surface->width;
+    backingImage->height = surface->height;
+    backingImage->fourcc = fmtInfo->fourcc;
+
+    if (!clearBackingImage(drv, backingImage)) {
+        goto fail;
+    }
+
+    return backingImage;
+
+fail:
+    destroyBackingImage(drv, backingImage);
+    return NULL;
+}
+
 static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface *surface) {
     NVDriverImage driverImages[3] = { 0 };
     BackingImage *backingImage = calloc(1, sizeof(BackingImage));
@@ -640,45 +767,15 @@ static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface
         backingImage->fds[i] = -1;
     }
 
-    if (isRgbSurfaceFourcc((uint32_t) surface->fourcc)) {
-        backingImage->format = NV_FORMAT_ARGB;
-    } else {
-    switch (surface->format)
-    {
-    case cudaVideoSurfaceFormat_P016:
-        switch (surface->bitDepth) {
-        case 10:
-            backingImage->format = NV_FORMAT_P010;
-            break;
-        case 12:
-            backingImage->format = NV_FORMAT_P012;
-            break;
-        default:
-            backingImage->format = NV_FORMAT_P016;
-            break;
-        }
-        break;
-
-    case cudaVideoSurfaceFormat_YUV444_16Bit:
-        backingImage->format = NV_FORMAT_Q416;
-        break;
-
-    case cudaVideoSurfaceFormat_YUV444:
-        backingImage->format = NV_FORMAT_444P;
-        break;
-
-    default:
-        backingImage->format = NV_FORMAT_NV12;
-        break;
-    }
-    }
+    backingImage->format = nvFormatForSurface(surface);
 
     const NVFormatInfo *fmtInfo = &formatsInfo[backingImage->format];
 
+    // Pass unifyBlockHeight=true: all planes are packed into one shared buffer under a
+    // single DRM modifier, so they must agree on one (largest) block height.
     backingImage->totalSize = calculate_unified_image_layout(&drv->driverContext, driverImages, surface->width, surface->height,
-                                                             fmtInfo->bppc, fmtInfo->numPlanes, fmtInfo->plane,
-                                                             true);
-    LOG("Allocating single BackingImage: %p %ux%u (format %d) = %u bytes", backingImage, surface->width, surface->height, backingImage->format, backingImage->totalSize);
+                                                             fmtInfo->bppc, fmtInfo->numPlanes, fmtInfo->plane, true);
+    LOG_DEBUG("Allocating single BackingImage: %p %ux%u = %u bytes", backingImage, surface->width, surface->height, backingImage->totalSize);
 
     int memFd = -1;
     int memFd2 = -1;
@@ -705,10 +802,21 @@ static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface
     memFd2 = -1;
 
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+        // The single buffer is exported under one DRM modifier that carries a
+        // single block height (log2GobsPerBlockY, the max across all planes).
+        // CUDA, however, derives a plane's block-linear layout from the array
+        // height it is handed, so a shorter plane (e.g. NV12 chroma when the
+        // coded height is ~86-170px, as at 144p) would be tiled with a smaller
+        // block than the modifier advertises. The importer then detiles that
+        // plane with the wrong block height and the chroma turns green. Create
+        // the array at the block-aligned height (memorySize / pitch) so CUDA
+        // lays every plane out with the same block height the modifier reports.
+        const uint32_t alignedHeight = driverImages[i].pitch != 0 ?
+            driverImages[i].memorySize / driverImages[i].pitch : driverImages[i].height;
         CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC mipmapArrayDesc = {
             .arrayDesc = {
                 .Width = driverImages[i].width,
-                .Height = driverImages[i].height,
+                .Height = alignedHeight,
                 .Depth = 0,
                 .Format = fmtInfo->bppc == 1 ? CU_AD_FORMAT_UNSIGNED_INT8 : CU_AD_FORMAT_UNSIGNED_INT16,
                 .NumChannels = fmtInfo->plane[i].channelCount,
@@ -717,11 +825,6 @@ static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface
             .numLevels = 1,
             .offset = driverImages[i].offset
         };
-
-        LOG("Plane %u: %ux%u offset=%u pitch=%u size=%u Format=%d NumChannels=%d",
-            i, mipmapArrayDesc.arrayDesc.Width, mipmapArrayDesc.arrayDesc.Height,
-            mipmapArrayDesc.offset, driverImages[i].pitch, driverImages[i].memorySize,
-            mipmapArrayDesc.arrayDesc.Format, mipmapArrayDesc.arrayDesc.NumChannels);
 
         if (CHECK_CUDA_RESULT(drv->cu->cuExternalMemoryGetMappedMipmappedArray(&backingImage->cudaImages[i].mipmapArray, backingImage->extMem, &mipmapArrayDesc))) {
             goto fail;
@@ -766,25 +869,29 @@ fail:
 }
 
 static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surface) {
-    /* direct_allocateBackingImage_single() unconditionally imports the buffer
-     * into CUDA (cuImportExternalMemory) with no fallback. When this process
-     * has no CUDA (e.g. a 32-bit sandboxed GPU process using the 64-bit
-     * nvenc-helper over IPC — see nvEndPictureEncodeIPC()), that call would
-     * either crash or fail outright, and the per-plane nvFds[] the IPC path
-     * needs would never be populated. Only take the single-buffer path when
-     * CUDA is actually available; otherwise fall through to the per-plane
-     * allocator below, which already has an explicit !cudaAvailable branch
-     * that keeps the nvFd handles for the helper to import.
-     *
-     * AUTO mode always allocates through the single-buffer path too: the
-     * per-surface choice between the split and combined *layer* layout is
-     * made later, at export time in direct_fillExportDescriptor(), and both
-     * layouts are produced from the same single-buffer backing image. */
-    if (drv->cudaAvailable &&
-        (drv->descriptorMode == DESCRIPTOR_MODE_SINGLE || drv->descriptorMode == DESCRIPTOR_MODE_COMBINED ||
-         drv->descriptorMode == DESCRIPTOR_MODE_AUTO) &&
-        !isRgbSurfaceFourcc((uint32_t) surface->fourcc)) {
-        return direct_allocateBackingImage_single(drv, surface);
+    // Multi-plane YUV surfaces must be exported as a single buffer holding every
+    // plane at an offset, so all planes share one DRM modifier. Chromium's
+    // vaapi_wrapper enforces one-modifier-per-buffer, so a per-plane export (a
+    // distinct modifier per fd) trips its CHECK and aborts the GPU process.
+    // Single-plane / packed surfaces (e.g. RGB) have nothing to unify and use the
+    // straightforward per-plane allocator below.
+    //
+    // Both of those allocators import every plane into CUDA unconditionally. In
+    // encode-only mode (a 32-bit client with no CUDA, encoding through the
+    // 64-bit nvenc-helper over IPC) fall through to the allocator below instead:
+    // it skips the CUDA import and keeps the opaque nvFds for the helper.
+    if (drv->cudaAvailable && !isRgbSurfaceFourcc((uint32_t) surface->fourcc)) {
+        // Multi-plane YUV: give every plane one shared block-linear modifier (required by
+        // Chromium's one-modifier-per-buffer rule) but put each plane in its OWN dma-buf
+        // object at offset 0. Packing the planes into a single buffer (chroma at a non-zero
+        // offset) is imported fine by Chromium's multi-plane path but mis-detiled by
+        // per-plane importers (mpv/GStreamer/ffmpeg), which import each layer as a
+        // standalone dma-buf and can't handle a tiled plane starting at a byte offset. The
+        // single-buffer layout is kept behind NVD_SINGLE_BUFFER for comparison/fallback.
+        if (nvdSingleBufferForced()) {
+            return direct_allocateBackingImage_single(drv, surface);
+        }
+        return direct_allocateBackingImage_perPlane(drv, surface);
     }
 
     NVDriverImage driverImages[3] = { 0 };
@@ -797,38 +904,7 @@ static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surfa
         backingImage->fds[i] = -1;
     }
 
-    if (isRgbSurfaceFourcc((uint32_t) surface->fourcc)) {
-        backingImage->format = NV_FORMAT_ARGB;
-    } else {
-    switch (surface->format)
-    {
-    case cudaVideoSurfaceFormat_P016:
-        switch (surface->bitDepth) {
-        case 10:
-            backingImage->format = NV_FORMAT_P010;
-            break;
-        case 12:
-            backingImage->format = NV_FORMAT_P012;
-            break;
-        default:
-            backingImage->format = NV_FORMAT_P016;
-            break;
-        }
-        break;
-
-    case cudaVideoSurfaceFormat_YUV444_16Bit:
-        backingImage->format = NV_FORMAT_Q416;
-        break;
-
-    case cudaVideoSurfaceFormat_YUV444:
-        backingImage->format = NV_FORMAT_444P;
-        break;
-    
-    default:
-        backingImage->format = NV_FORMAT_NV12;
-        break;
-    }
-    }
+    backingImage->format = nvFormatForSurface(surface);
 
     const NVFormatInfo *fmtInfo = &formatsInfo[backingImage->format];
     const NVFormatPlane *p = fmtInfo->plane;
@@ -1027,22 +1103,31 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
     const NVFormatInfo *fmtInfo = &formatsInfo[surface->backingImage->format];
     uint32_t y = 0;
 
+    // For the host-mapped external surface fallback we stage each plane through
+    // a host buffer. Plane 0 (luma) is always the largest, so allocate one
+    // buffer sized to it up front and reuse it for every plane instead of
+    // malloc/free per plane on every resolved frame.
+    uint8_t *stagingPlane = NULL;
+    if (surface->backingImage->externalMapping != NULL) {
+        const uint32_t stagingBytes = surface->width * fmtInfo->bppc * fmtInfo->plane[0].channelCount * surface->height;
+        stagingPlane = malloc(stagingBytes);
+        if (stagingPlane == NULL) {
+            return false;
+        }
+    }
+
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         const NVFormatPlane *p = &fmtInfo->plane[i];
         const uint32_t widthInBytes = (surface->width >> p->ss.x) * fmtInfo->bppc * p->channelCount;
         const uint32_t height = surface->height >> p->ss.y;
         if (surface->backingImage->externalMapping != NULL) {
-            uint8_t *plane = malloc((size_t) widthInBytes * height);
-            if (plane == NULL) {
-                return false;
-            }
             CUDA_MEMCPY2D cpy = {
                 .srcMemoryType = CU_MEMORYTYPE_DEVICE,
                 .srcDevice = ptr,
                 .srcY = y,
                 .srcPitch = pitch,
                 .dstMemoryType = CU_MEMORYTYPE_HOST,
-                .dstHost = plane,
+                .dstHost = stagingPlane,
                 .dstPitch = widthInBytes,
                 .Height = height,
                 .WidthInBytes = widthInBytes
@@ -1052,12 +1137,12 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
                 uint8_t *dst = (uint8_t*) surface->backingImage->externalMapping + surface->backingImage->offsets[i];
                 for (uint32_t row = 0; row < height; row++) {
                     memcpy(dst + (size_t) row * surface->backingImage->strides[i],
-                           plane + (size_t) row * widthInBytes,
+                           stagingPlane + (size_t) row * widthInBytes,
                            widthInBytes);
                 }
             }
-            free(plane);
             if (failed) {
+                free(stagingPlane);
                 return false;
             }
             y += height;
@@ -1082,6 +1167,8 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
         y += height;
     }
 
+    free(stagingPlane);
+
     //notify anyone waiting for us to be resolved
     pthread_mutex_lock(&surface->mutex);
     surface->resolving = 0;
@@ -1099,11 +1186,15 @@ static bool direct_realiseSurface(NVDriver *drv, NVSurface *surface) {
         //try to find a free surface
         BackingImage *img = direct_allocateBackingImage(drv, surface);
         if (img == NULL) {
-            // Reclaim oldest-first, retrying after each one, instead of
-            // destroying the whole detached cache at once: the most recently
-            // detached images are the most likely to still have their exported
-            // dma-buf in flight in the client, and freeing those corrupts the
-            // displayed frame.
+            // Allocation failed, typically under VRAM pressure. Reclaim detached
+            // backing images oldest-first, retrying the allocation after each
+            // one, instead of destroying the whole detached cache at once. The
+            // most-recently-detached images are the most likely to still have
+            // their exported dma-buf in flight in the client (or about to be
+            // re-imported across a codec/format switch); freeing those out from
+            // under the client corrupts the displayed frame. Oldest-first with a
+            // retry between each prune frees only what this allocation needs and
+            // keeps the recent frames alive.
             uint32_t reclaimed = 0;
             while (img == NULL && pruneOldestReclaimableDetachedBackingImage(drv)) {
                 reclaimed++;
@@ -1190,71 +1281,27 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
     desc->width = surface->width;
     desc->height = surface->height;
 
-    /* COMBINED-style export: a single layer carrying the combined fourcc
-     * (e.g. NV12) with multiple planes, instead of one split single-channel
-     * layer per plane (R8 + GR88). Some EGL/ANGLE DMA-BUF importers
-     * (Chrome's WebGL/canvas "video-processing" worker path, used to render
-     * the local encode/capture preview) only advertise support for the
-     * combined fourcc and reject the split layout with EGL_BAD_MATCH. The
-     * normal decode-display zero-copy import path expects (and must keep
-     * getting) the split per-plane layer form. COMBINED requires a
-     * single-buffer backing image, so it only applies when
-     * img->isSingleBuffer is true.
-     *
-     * In AUTO mode (the default) the decision is made per-surface using
-     * the deterministic isEncode flag on the surface's context:
-     *   - encode context (local capture/preview) → COMBINED
-     *   - decode context (remote peer, video playback)      → SINGLE
-     * Explicitly setting NVD_DESCRIPTOR_MODE=single/multi/combined forces
-     * that layout for every surface and overrides AUTO.
-     *
-     * Historical note: AUTO used to also treat a decode surface at the
-     * same resolution as an active encode context as a "self-preview" and
-     * exported it as COMBINED — the theory being that Chrome sometimes
-     * decodes its own just-encoded stream back for the local preview
-     * thumbnail, and that path (going through the same WebGL importer as
-     * the encode-preview path) needs COMBINED. In practice this heuristic
-     * false-triggered on every real WebRTC call: video-conferencing
-     * clients negotiate peers to the local camera's resolution
-     * (720p/540p/360p simulcast rungs), so a remote peer's decoded
-     * surface almost always matches a live local encode context — and
-     * mis-classifying it as a self-preview made Chrome's normal
-     * decode-display importer render that peer with green macroblock
-     * corruption. The heuristic is now off by AUTO default and lives
-     * behind NVD_SELF_PREVIEW_COMBINED=1 for the rare users who need it. */
-    const bool isEncodeSurface = surface->context != NULL && surface->context->isEncode;
-    const bool isSelfPreviewDecode = drv->selfPreviewCombinedOptIn &&
-        !isEncodeSurface &&
-        nvHasActiveEncodeContextWithResolution(drv, surface->width, surface->height);
-    const bool wantsCombined = drv->descriptorMode == DESCRIPTOR_MODE_COMBINED ||
-                                (drv->descriptorMode == DESCRIPTOR_MODE_AUTO &&
-                                 (isEncodeSurface || isSelfPreviewDecode));
-    const bool combinedLayer = wantsCombined && fmtInfo->numPlanes > 1 && img->isSingleBuffer;
+    desc->num_layers = fmtInfo->numPlanes;
 
-    desc->num_layers = combinedLayer ? 1 : fmtInfo->numPlanes;
-
-    LOG_DEBUG("Exporting surface descriptor: fourcc=0x%x, size=%ux%u, layers=%u",
-        desc->fourcc, desc->width, desc->height, desc->num_layers);
-
-    /* A VADRMPRIMESurfaceDescriptor carries one modifier per *object*, so a
-     * surface whose planes ended up with different block-linear modifiers is
-     * simply not representable: folding them into one object (SINGLE/COMBINED)
-     * describes chroma with luma's tiling, and splitting them into one object
-     * per plane (MULTI) trips Chromium's CHECK_EQ on uniform modifiers and
-     * aborts its GPU process. We advertise MIN_EXPORTABLE_SURFACE_HEIGHT so
-     * clients never allocate into that regime — this only fires if something
-     * created a surface below the advertised minimum anyway, in which case a
-     * loud log beats silent green macroblocks. */
+    /* Chromium CHECKs that every object of a descriptor carries the same
+     * modifier, and aborts its GPU process otherwise. On NVIDIA the
+     * block-linear modifier encodes a block height chosen from the plane
+     * height, so below ~172px the half-height chroma plane of a 4:2:0 surface
+     * lands in a smaller block than luma. The per-plane export then reports
+     * two different modifiers, and the single-buffer export describes chroma
+     * with luma's tiling. We advertise MIN_EXPORTABLE_SURFACE_HEIGHT so
+     * clients never allocate into that regime; this only fires if something
+     * created a surface below it anyway, and a loud log beats a silent crash
+     * or green macroblocks. */
     for (uint32_t i = 1; i < fmtInfo->numPlanes; i++) {
         if (img->mods[i] != img->mods[0]) {
             LOG("WARNING: surface %ux%u plane %u modifier 0x%llx differs from plane 0 modifier 0x%llx"
-                " — this surface is below the exportable height floor and will render incorrectly",
+                " — this surface is below the exportable height floor and will not import correctly",
                 surface->width, surface->height, i,
                 (unsigned long long) img->mods[i], (unsigned long long) img->mods[0]);
             break;
         }
     }
-
     nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS);
     if (img->isSingleBuffer) {
         nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS_SINGLE);
@@ -1263,22 +1310,12 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
         desc->objects[0].size = img->totalSize;
         desc->objects[0].drm_format_modifier = img->mods[0];
 
-        if (combinedLayer) {
-            desc->layers[0].drm_format = nvExportableFourcc(fmtInfo->fourcc);
-            desc->layers[0].num_planes = fmtInfo->numPlanes;
-            for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-                desc->layers[0].object_index[i] = 0;
-                desc->layers[0].offset[i] = img->offsets[i];
-                desc->layers[0].pitch[i] = img->strides[i];
-            }
-        } else {
-            for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-                desc->layers[i].drm_format = fmtInfo->plane[i].fourcc;
-                desc->layers[i].num_planes = 1;
-                desc->layers[i].object_index[0] = 0;
-                desc->layers[i].offset[0] = img->offsets[i];
-                desc->layers[i].pitch[0] = img->strides[i];
-            }
+        for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+            desc->layers[i].drm_format = fmtInfo->plane[i].fourcc;
+            desc->layers[i].num_planes = 1;
+            desc->layers[i].object_index[0] = 0;
+            desc->layers[i].offset[0] = img->offsets[i];
+            desc->layers[i].pitch[0] = img->strides[i];
         }
     } else {
         nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS_MULTI);
