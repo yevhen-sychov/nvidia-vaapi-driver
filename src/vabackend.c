@@ -5585,6 +5585,17 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         }
 
         nvQueryConfigProfiles2(ctx, drv->profiles, &drv->profileCount);
+
+        // Nothing to decode or encode on this GPU: fail init so libva reports
+        // the driver as unusable instead of loading one that advertises no
+        // profiles (upstream #400).
+        if (drv->profileCount == 0) {
+            LOG("Hardware doesn't seem to support profiles, bailing out");
+            CHECK_CUDA_RESULT(cu->cuCtxDestroy(drv->cudaContext));
+            drv->backend->releaseExporter(drv);
+            free(drv);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
     } else {
         /* Encode-only IPC path: no CUDA context, no decode profiles.
          * Init the direct backend for GPU surface allocation via DRM.
