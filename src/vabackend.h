@@ -106,6 +106,9 @@ typedef struct
     uint32_t                importedOffsets[4];
     uint32_t                importedNumPlanes;
     uint32_t                importedDataSize;
+    // Set once the surface has been handed out as a dma-buf. The client can
+    // then read the frame without a driver call that would wait for it.
+    atomic_bool             exported;
 } NVSurface;
 
 typedef enum
