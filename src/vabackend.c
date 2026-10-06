@@ -564,6 +564,14 @@ void* nvGetObjectPtr(NVDriver *drv, ObjectType type, VAGenericID id) {
     return NULL;
 }
 
+NVSurface *nvGetSurface(NVDriver *drv, VASurfaceID id) {
+    return nvGetObjectPtr(drv, OBJECT_TYPE_SURFACE, id);
+}
+
+NVBuffer *nvGetBuffer(NVDriver *drv, VABufferID id) {
+    return nvGetObjectPtr(drv, OBJECT_TYPE_BUFFER, id);
+}
+
 static Object getObjectByPtr(NVDriver *drv, ObjectType type, void *ptr) {
     Object ret = NULL;
     if (ptr != NULL) {
@@ -578,7 +586,6 @@ static Object getObjectByPtr(NVDriver *drv, ObjectType type, void *ptr) {
     }
     return ret;
 }
-
 static void setSurfaceResolving(NVSurface *surface, bool resolving);
 
 // Requires drv->objectCreationMutex to be held by the caller.
@@ -1869,6 +1876,10 @@ static void setSurfaceResolving(NVSurface *surface, bool resolving) {
     pthread_mutex_unlock(&surface->mutex);
 }
 
+void nvSetSurfaceResolving(NVSurface *surface, bool resolving) {
+    setSurfaceResolving(surface, resolving);
+}
+
 static void waitSurfaceResolved(NVSurface *surface) {
     if (surface == NULL) {
         return;
@@ -2184,6 +2195,9 @@ static VAStatus nvDestroySurfaces(
         ARRAY_FOR_EACH(Object, o, &drv->objects)
             if (o->type == OBJECT_TYPE_CONTEXT) {
                 NVContext *nvCtx = (NVContext*) o->obj;
+                if (nvCtx->codec != NULL && nvCtx->codec->surfaceDestroyed != NULL) {
+                    nvCtx->codec->surfaceDestroyed(nvCtx, surface_list[i], surface);
+                }
                 // nvEndPicture may wait on the most recently queued surface before
                 // resizing the decoder's display area; don't let it point at a
                 // surface that is going away.
@@ -2229,6 +2243,11 @@ static VAStatus nvDestroySurfaces(
          * does, across resolution changes and pool resizes — exhausts the
          * context's 32 slots and every later vaBeginPicture fails with
          * VA_STATUS_ERROR_MAX_NUM_EXCEEDED. */
+        pthread_mutex_lock(&drv->objectCreationMutex);
+        releasePictureIdxLocked(drv, surface);
+        pthread_mutex_unlock(&drv->objectCreationMutex);
+
+        //the resolve is done, so the context can hand the picture index out again
         pthread_mutex_lock(&drv->objectCreationMutex);
         releasePictureIdxLocked(drv, surface);
         pthread_mutex_unlock(&drv->objectCreationMutex);
@@ -2547,6 +2566,7 @@ static bool acquirePictureIdxLocked(NVDriver *drv, NVContext *nvCtx, NVSurface *
         victim->pictureIdx = -1;
     }
     nvCtx->pictureIdxOwners[idx] = surface;
+    nvCtx->pictureIdxAssigned = true;
     surface->pictureIdx = idx;
     touchPictureIdx(drv, surface);
     return true;
@@ -2559,7 +2579,7 @@ static VAStatus recreateDecoderForSurface(NVContext *nvCtx, NVSurface *surface) 
         return VA_STATUS_SUCCESS;
     }
 
-    if (nvCtx->decodeStarted) {
+    if (nvCtx->pictureIdxAssigned) {
         LOG("Decoder/surface format mismatch after decode start: decoder format=%d chroma=%d bitDepth=%d, surface format=%d chroma=%d bitDepth=%d",
             nvCtx->decoderSurfaceFormat, nvCtx->decoderChromaFormat, nvCtx->decoderBitDepth,
             surface->format, surface->chromaFormat, surface->bitDepth);
@@ -3978,9 +3998,16 @@ static VAStatus nvBeginPicture(
         endVideoProcCall(drv, nvCtx, false);
         return VA_STATUS_SUCCESS;
     }
-    if (nvCtx->decodeDestroying) {
+    if (nvCtx->decodeDestroying || (!nvCtx->isEncode && nvCtx->codec == NULL)) {
         pthread_mutex_unlock(&drv->objectCreationMutex);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    if (nvCtx->codec != NULL && nvCtx->codec->checkPicture != NULL) {
+        VAStatus status = nvCtx->codec->checkPicture(nvCtx, NV_PICTURE_BEGIN);
+        if (status != VA_STATUS_SUCCESS) {
+            pthread_mutex_unlock(&drv->objectCreationMutex);
+            return status;
+        }
     }
     nvCtx->activeDecodeCalls++;
     pthread_mutex_unlock(&drv->objectCreationMutex);
@@ -4000,7 +4027,7 @@ static VAStatus nvBeginPicture(
         if (surface->backingImage != NULL) {
             detachBackingImageFromSurface(drv, surface);
         }
-        //...and hand its picture index back to the context that owned it
+        //...and hand its picture index back to the context that assigned it
         pthread_mutex_lock(&drv->objectCreationMutex);
         releasePictureIdxLocked(drv, surface);
         pthread_mutex_unlock(&drv->objectCreationMutex);
@@ -4021,7 +4048,6 @@ static VAStatus nvBeginPicture(
         return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
     }
     touchPictureIdx(drv, surface);
-    nvCtx->decodeStarted = true;
     surface->contextId = context;
     //the encode paths need the context
     //itself, so keep the back-pointer in step with the ID
@@ -4036,7 +4062,7 @@ static VAStatus nvBeginPicture(
     nvSurfaceResetColorMetadata(nvCtx->renderTarget);
     nvCtx->pPicParams.CurrPicIdx = nvCtx->renderTarget->pictureIdx;
     if (nvCtx->codec != NULL && nvCtx->codec->beginPicture != NULL) {
-        nvCtx->codec->beginPicture(nvCtx);
+        nvCtx->codec->beginPicture(nvCtx, render_target);
     }
 
     endDecodeCall(drv, nvCtx);
@@ -4111,16 +4137,28 @@ static VAStatus nvRenderPicture(
         endVideoProcCall(drv, nvCtx, true);
         return status;
     }
-    if (nvCtx->decodeDestroying) {
+    if (nvCtx->decodeDestroying || (!nvCtx->isEncode && nvCtx->codec == NULL)) {
         pthread_mutex_unlock(&drv->objectCreationMutex);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    if (nvCtx->codec != NULL && nvCtx->codec->checkPicture != NULL) {
+        VAStatus status = nvCtx->codec->checkPicture(nvCtx, NV_PICTURE_RENDER);
+        if (status != VA_STATUS_SUCCESS) {
+            pthread_mutex_unlock(&drv->objectCreationMutex);
+            return status;
+        }
     }
     nvCtx->activeDecodeCalls++;
     pthread_mutex_unlock(&drv->objectCreationMutex);
 
+    if (nvCtx->codec != NULL && nvCtx->codec->renderPicture != NULL) {
+        VAStatus status = nvCtx->codec->renderPicture(nvCtx, buffers, num_buffers);
+        endDecodeCall(drv, nvCtx);
+        return status;
+    }
     for (int i = 0; i < num_buffers; i++) {
         NVBuffer *buf = (NVBuffer*) nvGetObjectPtr(drv, OBJECT_TYPE_BUFFER, buffers[i]);
-        if (buf == NULL || buf->ptr == NULL) {
+        if (buf == NULL || buf->ptr == NULL || (unsigned int) buf->bufferType >= VABufferTypeMax) {
             LOG("Invalid buffer detected, skipping: %d", buffers[i]);
             continue;
         }
@@ -4231,14 +4269,29 @@ static VAStatus nvEndPicture(
         return encodeStatus;
     }
 
-    if (nvCtx->decoder == NULL) {
+    if (nvCtx->decoder == NULL || nvCtx->codec == NULL) {
         pthread_mutex_unlock(&drv->objectCreationMutex);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    if (nvCtx->codec != NULL && nvCtx->codec->checkPicture != NULL) {
+        VAStatus status = nvCtx->codec->checkPicture(nvCtx, NV_PICTURE_END);
+        if (status != VA_STATUS_SUCCESS) {
+            pthread_mutex_unlock(&drv->objectCreationMutex);
+            return status;
+        }
     }
     nvCtx->activeDecodeCalls++;
     pthread_mutex_unlock(&drv->objectCreationMutex);
 
     CUVIDPICPARAMS *picParams = &nvCtx->pPicParams;
+
+    if (nvCtx->codec != NULL && nvCtx->codec->prepareDecode != NULL) {
+        VAStatus status = nvCtx->codec->prepareDecode(nvCtx);
+        if (status != VA_STATUS_SUCCESS) {
+            endDecodeCall(drv, nvCtx);
+            return status;
+        }
+    }
 
     picParams->pBitstreamData = nvCtx->bitstreamBuffer.buf;
     picParams->pSliceDataOffsets = nvCtx->sliceOffsets.buf;
@@ -4246,6 +4299,7 @@ static VAStatus nvEndPicture(
     nvCtx->sliceOffsets.size = 0;
 
     if (CHECK_CUDA_RESULT(cu->cuCtxPushCurrent(drv->cudaContext))) {
+        if (nvCtx->codec != NULL && nvCtx->codec->abortPicture != NULL) nvCtx->codec->abortPicture(nvCtx);
         endDecodeCall(drv, nvCtx);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
@@ -4265,6 +4319,7 @@ static VAStatus nvEndPicture(
         nvCtx->decoderHasDecoded = true;
     }
     if (CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL))) {
+        if (nvCtx->codec != NULL && nvCtx->codec->abortPicture != NULL) nvCtx->codec->abortPicture(nvCtx);
         endDecodeCall(drv, nvCtx);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
@@ -4278,7 +4333,13 @@ static VAStatus nvEndPicture(
     }
     //LOG("Decoded frame successfully to idx: %d (%p)", picParams->CurrPicIdx, nvCtx->renderTarget);
 
+    // Codecs can defer publication until a complete output picture is available.
     NVSurface *surface = nvCtx->displayTarget != NULL ? nvCtx->displayTarget : nvCtx->renderTarget;
+    surface->topFieldFirst = !picParams->bottom_field_flag;
+    if (nvCtx->codec != NULL && nvCtx->codec->finishDecode != NULL && !nvCtx->codec->finishDecode(nvCtx, status)) {
+        endDecodeCall(drv, nvCtx);
+        return status;
+    }
     if (surface != nvCtx->renderTarget) {
         setSurfaceResolving(surface, true);
         setSurfaceResolving(nvCtx->renderTarget, false);
@@ -4289,7 +4350,6 @@ static VAStatus nvEndPicture(
     pthread_mutex_lock(&drv->objectCreationMutex);
     surface->contextId = context;
     pthread_mutex_unlock(&drv->objectCreationMutex);
-    surface->topFieldFirst = !picParams->bottom_field_flag;
     surface->secondField = picParams->second_field;
     surface->decodeFailed = status != VA_STATUS_SUCCESS;
 
@@ -4490,15 +4550,8 @@ static VAStatus nvCreateImage(
      * An array indicating the scanline pitch in bytes for each plane.
      * Each plane may have a different pitch. Maximum 3 planes for planar formats
      */
-    /* Row bytes must account for both chroma subsampling and the number of
-     * interleaved channels. width * bppc happens to be right for NV12/P010
-     * (the /2 horizontal subsampling of the UV plane cancels its 2 channels)
-     * and for the single-channel planar formats, but it is 4x too small for
-     * the packed RGB formats, which made vaGetImage/vaPutImage on an RGB image
-     * fail with CUDA_ERROR_INVALID_VALUE. */
     for (uint32_t i = 0; i < 3; i++) {
-        const uint32_t planeIdx = i < fmtInfo->numPlanes ? i : fmtInfo->numPlanes - 1;
-        image->pitches[i] = (width >> p[planeIdx].ss.x) * fmtInfo->bppc * p[planeIdx].channelCount;
+        image->pitches[i] = i < fmtInfo->numPlanes ? (width >> p[i].ss.x) * fmtInfo->bppc * p[i].channelCount : 0;
     }
     /*
      * An array indicating the byte offset from the beginning of the image data
